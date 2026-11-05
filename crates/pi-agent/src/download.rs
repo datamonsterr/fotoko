@@ -1,20 +1,27 @@
-//! Image download: https only (http when allowed), size cap while streaming, magic bytes and
-//! header checks, temporary files that clean up after themselves.
+//! Image download: https only (http in simulation), allowed hosts, no private addresses, size
+//! cap while streaming, magic bytes and header checks, temporary files that clean up after
+//! themselves.
 
 use std::error::Error as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fotoko_printer_sim::probe_file;
 use fotoko_protocol::{ContentType, PiErrorCode};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Url, redirect};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use url::Host;
 
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const JPEG_SIGNATURE: [u8; 3] = [0xFF, 0xD8, 0xFF];
 /// Bytes needed to decide a signature.
 const SIGNATURE_LEN: usize = PNG_SIGNATURE.len();
+/// Longest file stem kept (jobs and photos have uuid-like ids; this only bounds hostile input).
+const MAX_STEM_LEN: usize = 120;
 
 /// Why a photo could not be fetched or accepted.
 #[derive(Debug, Error)]
@@ -25,6 +32,9 @@ pub enum DownloadError {
     /// The scheme is not allowed.
     #[error("image url must use https")]
     InsecureScheme,
+    /// The host is not on the allow list or is a non-public address.
+    #[error("image host not allowed: {0}")]
+    ForbiddenHost(String),
     /// The HTTP client could not be built.
     #[error("cannot build http client: {0}")]
     Client(String),
@@ -55,10 +65,20 @@ impl DownloadError {
             Self::TooLarge(_) | Self::BadMagic(_) | Self::Invalid(_) => PiErrorCode::InvalidImage,
             Self::BadUrl
             | Self::InsecureScheme
+            | Self::ForbiddenHost(_)
             | Self::Client(_)
             | Self::Network(_)
             | Self::Status(_)
             | Self::Io(_) => PiErrorCode::DownloadFailed,
+        }
+    }
+
+    /// Message safe to send to the cloud: no hosts, addresses, paths or library text. The full
+    /// error is for the local log only.
+    pub fn public_message(&self) -> &'static str {
+        match self.code() {
+            PiErrorCode::InvalidImage => "image rejected",
+            _ => "download failed",
         }
     }
 }
@@ -82,17 +102,117 @@ impl Drop for TempFile {
     }
 }
 
-/// Parse an image URL and enforce the scheme rule.
-pub fn check_url(url: &str, allow_http: bool) -> Result<Url, DownloadError> {
+/// Which URLs may be fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlPolicy {
+    /// Simulation mode: plain `http` and any host, including loopback, are allowed.
+    pub allow_insecure: bool,
+    /// Host suffixes (`.amazonaws.com` matches subdomains) or exact host names.
+    pub allowed_hosts: Vec<String>,
+}
+
+impl UrlPolicy {
+    /// Production policy: https only, the given hosts only.
+    pub fn strict(allowed_hosts: Vec<String>) -> Self {
+        Self {
+            allow_insecure: false,
+            allowed_hosts,
+        }
+    }
+
+    /// Simulation policy: anything goes.
+    pub fn permissive() -> Self {
+        Self {
+            allow_insecure: true,
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+/// Whether `host` matches an allow-list entry: `.example.com` matches subdomains only,
+/// anything else must be equal (case-insensitive).
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allowed.iter().any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        if entry.starts_with('.') {
+            host.ends_with(&entry) && host.len() > entry.len()
+        } else {
+            host == entry
+        }
+    })
+}
+
+/// Whether an address is publicly routable (not loopback, private, link-local, shared,
+/// reserved, multicast or documentation space).
+pub fn is_global(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_global_v4(v4),
+        IpAddr::V6(v6) => is_global_v6(v6),
+    }
+}
+
+fn is_global_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || a == 0
+        || (a == 100 && (64..128).contains(&b)) // shared address space
+        || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+        || (a == 198 && (b == 18 || b == 19)) // benchmarking
+        || a >= 240) // reserved
+}
+
+fn is_global_v6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_global_v4(v4);
+    }
+    let first = ip.segments()[0];
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00 // unique local
+        || (first & 0xffc0) == 0xfe80 // link local
+        || (first == 0x2001 && ip.segments()[1] == 0x0db8) // documentation
+        || (first == 0x0064 && ip.segments()[1] == 0xff9b)) // NAT64 can reach private v4
+}
+
+/// Parse an image URL and enforce the policy: scheme, host allow list and IP literals. Host
+/// names are checked again for the addresses they resolve to (see [`Downloader`]).
+pub fn check_url(url: &str, policy: &UrlPolicy) -> Result<Url, DownloadError> {
     let parsed = Url::parse(url).map_err(|_| DownloadError::BadUrl)?;
-    if parsed.host_str().is_none() {
-        return Err(DownloadError::BadUrl);
-    }
+    let host = parsed.host().ok_or(DownloadError::BadUrl)?;
     match parsed.scheme() {
-        "https" => Ok(parsed),
-        "http" if allow_http => Ok(parsed),
-        _ => Err(DownloadError::InsecureScheme),
+        "https" => {}
+        "http" if policy.allow_insecure => {}
+        _ => return Err(DownloadError::InsecureScheme),
     }
+    if policy.allow_insecure {
+        return Ok(parsed);
+    }
+    match host {
+        Host::Domain(name) => {
+            if !host_allowed(name, &policy.allowed_hosts) {
+                return Err(DownloadError::ForbiddenHost(name.to_owned()));
+            }
+        }
+        Host::Ipv4(ip) => {
+            if !is_global(IpAddr::V4(ip)) || !host_allowed(&ip.to_string(), &policy.allowed_hosts) {
+                return Err(DownloadError::ForbiddenHost(ip.to_string()));
+            }
+        }
+        Host::Ipv6(ip) => {
+            if !is_global(IpAddr::V6(ip)) || !host_allowed(&ip.to_string(), &policy.allowed_hosts) {
+                return Err(DownloadError::ForbiddenHost(ip.to_string()));
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 /// Whether leading bytes match the declared type.
@@ -118,9 +238,9 @@ fn mime(content_type: ContentType) -> &'static str {
     }
 }
 
-/// Make an id safe as a file name component: ASCII alphanumerics, `-` and `_` stay, everything
-/// else becomes `_`, and the result is never empty.
-pub fn sanitize_component(text: &str) -> String {
+/// Make text safe as a file name component: ASCII alphanumerics, `-` and `_` stay, everything
+/// else becomes `_`; the result is never empty and at most `max` characters.
+pub fn sanitize_component(text: &str, max: usize) -> String {
     let cleaned: String = text
         .chars()
         .map(|c| {
@@ -130,12 +250,24 @@ pub fn sanitize_component(text: &str) -> String {
                 '_'
             }
         })
+        .take(max)
         .collect();
     if cleaned.is_empty() {
         "_".to_owned()
     } else {
         cleaned
     }
+}
+
+/// File stem for photo number `index` of a job. The index keeps two photos with the same
+/// (hostile or buggy) id apart; each id part is cut to a sane length.
+pub fn photo_stem(job_id: &str, index: usize, photo_id: &str) -> String {
+    let half = (MAX_STEM_LEN - 8) / 2;
+    format!(
+        "{}-{index}-{}",
+        sanitize_component(job_id, half),
+        sanitize_component(photo_id, half)
+    )
 }
 
 fn describe(error: reqwest::Error) -> String {
@@ -151,34 +283,71 @@ fn describe(error: reqwest::Error) -> String {
     text
 }
 
+/// DNS resolver that refuses to hand out non-public addresses, so a public name that points
+/// at the LAN (or flips there after the allow-list check) cannot be fetched.
+#[derive(Debug)]
+struct PublicOnly;
+
+impl Resolve for PublicOnly {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let found: Vec<_> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let public: Vec<_> = found
+                .iter()
+                .copied()
+                .filter(|a| is_global(a.ip()))
+                .collect();
+            if public.is_empty() {
+                let reason = if found.is_empty() {
+                    "no addresses"
+                } else {
+                    "only non-public addresses"
+                };
+                return Err(format!("{host}: {reason}").into());
+            }
+            Ok(Box::new(public.into_iter()) as Addrs)
+        })
+    }
+}
+
 /// HTTP client for presigned image URLs.
 #[derive(Debug, Clone)]
 pub struct Downloader {
     client: Client,
-    allow_http: bool,
+    policy: UrlPolicy,
     max_bytes: u64,
 }
 
 impl Downloader {
-    /// `timeout` bounds each whole download. Redirects are not followed.
-    pub fn new(allow_http: bool, max_bytes: u64, timeout: Duration) -> Result<Self, DownloadError> {
+    /// `timeout` bounds each whole download. Redirects and proxies are not used.
+    pub fn new(
+        policy: UrlPolicy,
+        max_bytes: u64,
+        timeout: Duration,
+    ) -> Result<Self, DownloadError> {
         crate::tls::install_crypto_provider();
-        let client = Client::builder()
+        let mut builder = Client::builder()
+            .no_proxy()
             .redirect(redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10).min(timeout))
             .timeout(timeout)
-            .user_agent(concat!("fotoko-pi-agent/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("fotoko-pi-agent/", env!("CARGO_PKG_VERSION")));
+        if !policy.allow_insecure {
+            builder = builder.dns_resolver(Arc::new(PublicOnly));
+        }
+        let client = builder
             .build()
             .map_err(|e| DownloadError::Client(describe(e)))?;
         Ok(Self {
             client,
-            allow_http,
+            policy,
             max_bytes,
         })
     }
 
-    /// Download `url` into `dir` as `{stem}.{jpg|png}` and validate it against `content_type`.
-    /// On any error nothing is left on disk.
+    /// Download `url` into `dir` as `{stem}.{jpg|png}` (never overwriting, mode 0600) and
+    /// validate it against `content_type`. On any error nothing is left on disk.
     pub async fn fetch(
         &self,
         url: &str,
@@ -186,7 +355,7 @@ impl Downloader {
         dir: &Path,
         stem: &str,
     ) -> Result<TempFile, DownloadError> {
-        let url = check_url(url, self.allow_http)?;
+        let url = check_url(url, &self.policy)?;
         let mut response = self
             .client
             .get(url)
@@ -204,10 +373,15 @@ impl Downloader {
         }
         let path = dir.join(format!(
             "{}.{}",
-            sanitize_component(stem),
+            sanitize_component(stem, MAX_STEM_LEN),
             extension(content_type)
         ));
-        let mut file = tokio::fs::File::create(&path)
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
             .await
             .map_err(|e| DownloadError::Io(e.to_string()))?;
         let temp = TempFile { path };
@@ -245,7 +419,11 @@ impl Downloader {
             .await
             .map_err(|e| DownloadError::Io(e.to_string()))?;
         drop(file);
-        let info = probe_file(temp.path()).map_err(|e| DownloadError::Invalid(e.to_string()))?;
+        let probe_path = temp.path().to_owned();
+        let info = tokio::task::spawn_blocking(move || probe_file(&probe_path))
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?
+            .map_err(|e| DownloadError::Invalid(e.to_string()))?;
         if info.mime != label {
             return Err(DownloadError::BadMagic(label));
         }
@@ -345,7 +523,7 @@ mod tests {
     }
 
     fn downloader(max: u64) -> Downloader {
-        Downloader::new(true, max, Duration::from_secs(5)).unwrap()
+        Downloader::new(UrlPolicy::permissive(), max, Duration::from_secs(5)).unwrap()
     }
 
     async fn fetch(
@@ -365,40 +543,146 @@ mod tests {
         std::fs::read_dir(dir.path()).unwrap().next().is_none()
     }
 
+    fn strict() -> UrlPolicy {
+        UrlPolicy::strict(vec![".amazonaws.com".into(), "files.example.org".into()])
+    }
+
     #[test]
-    fn url_rules() {
-        assert!(
-            check_url(
-                "https://bucket.s3.amazonaws.com/k?X-Amz-Signature=abc",
-                false
-            )
-            .is_ok()
-        );
-        assert!(check_url("http://127.0.0.1:1/x", true).is_ok());
+    fn url_rules_in_production() {
+        let ok = |u: &str| check_url(u, &strict()).is_ok();
+        assert!(ok(
+            "https://bucket.s3.ap-southeast-1.amazonaws.com/k?X-Amz-Signature=abc"
+        ));
+        assert!(ok("https://files.example.org/x"));
+        assert!(ok("https://BUCKET.S3.AMAZONAWS.COM./x"));
+        let err = |u: &str| check_url(u, &strict()).unwrap_err();
         assert!(matches!(
-            check_url("http://127.0.0.1:1/x", false),
+            err("http://bucket.s3.amazonaws.com/x"),
+            DownloadError::InsecureScheme
+        ));
+        assert!(matches!(err("ftp://h/x"), DownloadError::InsecureScheme));
+        assert!(matches!(err("file:///etc/passwd"), DownloadError::BadUrl));
+        assert!(matches!(err("data:text/plain,hi"), DownloadError::BadUrl));
+        assert!(matches!(err("not a url"), DownloadError::BadUrl));
+        assert!(matches!(err("https://"), DownloadError::BadUrl));
+        for forbidden in [
+            "https://evil.example.com/x",
+            "https://amazonaws.com/x",
+            "https://notamazonaws.com/x",
+            "https://amazonaws.com.evil.io/x",
+            "https://s3.amazonaws.com@evil.io/x",
+            "https://127.0.0.1/x",
+            "https://10.0.0.5/x",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/x",
+            "https://[fe80::1]/x",
+            "https://8.8.8.8/x",
+            "https://localhost/x",
+        ] {
+            assert!(
+                matches!(err(forbidden), DownloadError::ForbiddenHost(_)),
+                "{forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_address_classification() {
+        let global = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "100.63.0.1",
+            "172.32.0.1",
+        ];
+        let local = [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.51.100.7",
+            "203.0.113.9",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+        ];
+        for ip in global {
+            assert!(is_global(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in local {
+            assert!(!is_global(ip.parse().unwrap()), "{ip}");
+        }
+        assert!(is_global("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn host_matching() {
+        let allowed = vec![".amazonaws.com".to_owned(), "Files.Example.org".to_owned()];
+        assert!(host_allowed("a.amazonaws.com", &allowed));
+        assert!(host_allowed("a.b.amazonaws.com.", &allowed));
+        assert!(host_allowed("files.example.org", &allowed));
+        assert!(!host_allowed("amazonaws.com", &allowed));
+        assert!(!host_allowed("xamazonaws.com", &allowed));
+        assert!(!host_allowed("evil.files.example.org", &allowed));
+        assert!(!host_allowed("a.amazonaws.com", &[]));
+    }
+
+    #[test]
+    fn permissive_policy_allows_http_and_loopback() {
+        let p = UrlPolicy::permissive();
+        assert!(check_url("http://127.0.0.1:1/x", &p).is_ok());
+        assert!(check_url("https://localhost/x", &p).is_ok());
+        assert!(matches!(
+            check_url("ftp://h/x", &p),
             Err(DownloadError::InsecureScheme)
         ));
         assert!(matches!(
-            check_url("ftp://h/x", true),
-            Err(DownloadError::InsecureScheme)
-        ));
-        assert!(matches!(
-            check_url("file:///etc/passwd", true),
+            check_url("data:x", &p),
             Err(DownloadError::BadUrl)
         ));
-        assert!(matches!(
-            check_url("data:text/plain,hi", true),
-            Err(DownloadError::BadUrl)
-        ));
-        assert!(matches!(
-            check_url("not a url", true),
-            Err(DownloadError::BadUrl)
-        ));
-        assert!(matches!(
-            check_url("https://", true),
-            Err(DownloadError::BadUrl)
-        ));
+    }
+
+    #[test]
+    fn public_messages_hide_details() {
+        let secret = "https://bucket.s3.amazonaws.com/k?X-Amz-Signature=SECRET 10.0.0.1";
+        for error in [
+            DownloadError::Network(secret.into()),
+            DownloadError::ForbiddenHost(secret.into()),
+            DownloadError::Io(secret.into()),
+            DownloadError::Status(500),
+            DownloadError::BadUrl,
+            DownloadError::InsecureScheme,
+            DownloadError::Client(secret.into()),
+        ] {
+            assert_eq!(error.public_message(), "download failed");
+        }
+        for error in [
+            DownloadError::Invalid(secret.into()),
+            DownloadError::TooLarge(1),
+            DownloadError::BadMagic("image/png"),
+        ] {
+            assert_eq!(error.public_message(), "image rejected");
+        }
     }
 
     #[test]
@@ -418,16 +702,30 @@ mod tests {
     fn extensions_and_sanitizing() {
         assert_eq!(extension(ContentType::Jpeg), "jpg");
         assert_eq!(extension(ContentType::Png), "png");
-        assert_eq!(sanitize_component("job-1_ph"), "job-1_ph");
-        assert_eq!(sanitize_component("../../etc/passwd"), "______etc_passwd");
-        assert_eq!(sanitize_component(""), "_");
-        assert_eq!(sanitize_component("ünï"), "_n_");
+        assert_eq!(sanitize_component("job-1_ph", 50), "job-1_ph");
+        assert_eq!(
+            sanitize_component("../../etc/passwd", 50),
+            "______etc_passwd"
+        );
+        assert_eq!(sanitize_component("", 50), "_");
+        assert_eq!(sanitize_component("ünï", 50), "_n_");
+        assert_eq!(sanitize_component("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn photo_stems_are_unique_bounded_and_safe() {
+        assert_eq!(photo_stem("job1", 0, "p1"), "job1-0-p1");
+        assert_ne!(photo_stem("job1", 0, "same"), photo_stem("job1", 1, "same"));
+        let long = "x".repeat(500);
+        assert!(photo_stem(&long, 12, &long).len() <= MAX_STEM_LEN);
+        assert_eq!(photo_stem("../a", 3, "b/c"), "___a-3-b_c");
     }
 
     #[test]
     fn error_codes() {
         use PiErrorCode::{DownloadFailed, InvalidImage};
         let cases = [
+            (DownloadError::ForbiddenHost("x".into()), DownloadFailed),
             (DownloadError::BadUrl, DownloadFailed),
             (DownloadError::InsecureScheme, DownloadFailed),
             (DownloadError::Client("x".into()), DownloadFailed),
@@ -554,7 +852,8 @@ mod tests {
     async fn times_out_slow_servers() {
         let addr = serve(app()).await;
         let dir = tempfile::tempdir().unwrap();
-        let d = Downloader::new(true, 1 << 20, Duration::from_millis(200)).unwrap();
+        let d =
+            Downloader::new(UrlPolicy::permissive(), 1 << 20, Duration::from_millis(200)).unwrap();
         let r = d
             .fetch(
                 &format!("http://{addr}/slow"),
@@ -569,7 +868,12 @@ mod tests {
     #[tokio::test]
     async fn refuses_http_unless_allowed_and_bad_urls() {
         let dir = tempfile::tempdir().unwrap();
-        let strict = Downloader::new(false, 1 << 20, Duration::from_secs(1)).unwrap();
+        let strict = Downloader::new(
+            UrlPolicy::strict(vec![".amazonaws.com".into()]),
+            1 << 20,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let r = strict
             .fetch("http://127.0.0.1:9/x", ContentType::Png, dir.path(), "j")
             .await;
@@ -589,6 +893,45 @@ mod tests {
             )
             .await;
         assert!(matches!(r, Err(DownloadError::Io(_))), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn never_overwrites_an_existing_file_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let addr = serve(app()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let d = downloader(1 << 20);
+        let url = format!("http://{addr}/png");
+        let first = d
+            .fetch(&url, ContentType::Png, dir.path(), "same")
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(first.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let second = d.fetch(&url, ContentType::Png, dir.path(), "same").await;
+        assert!(matches!(second, Err(DownloadError::Io(_))), "{second:?}");
+        assert!(
+            first.path().exists(),
+            "the first file must survive the collision"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_refuses_names_that_resolve_to_private_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = UrlPolicy::strict(vec!["localhost".into()]);
+        let d = Downloader::new(policy, 1 << 20, Duration::from_secs(5)).unwrap();
+        let r = d
+            .fetch("https://localhost:9/x", ContentType::Png, dir.path(), "j")
+            .await;
+        let Err(DownloadError::Network(message)) = r else {
+            panic!("{r:?}")
+        };
+        assert!(message.contains("non-public"), "{message}");
     }
 
     #[tokio::test]

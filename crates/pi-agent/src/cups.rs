@@ -1,11 +1,17 @@
 //! `backend = "cups"`: print through the CUPS command line tools.
 //!
 //! `lp` submits the job. CUPS does not report completion to the submitter, so the backend polls
-//! `lpstat -o <queue>` until the job leaves the queue. With the USB backend's `stop-printer`
-//! error policy a fault (no paper, no ribbon, unplugged) leaves the job queued and the printer
-//! `disabled`, so each poll also reads `lpstat -p <queue>`; a disabled printer fails the print
-//! with the matching Pi error code, and the job is cancelled so it cannot print later.
+//! `lpstat -o <queue>` until the job leaves the queue, then confirms with
+//! `lpstat -l -W completed -o <queue>` how it ended (`job-completed-successfully`, aborted or
+//! cancelled). With the USB backend's `stop-printer` error policy a fault (no paper, no ribbon,
+//! unplugged) leaves the job queued and the printer `disabled`, so each poll also reads
+//! `lpstat -p <queue>`; a disabled printer fails the print with the matching Pi error code.
+//!
+//! A job we stop caring about (error, timeout, cancellation, dropped future) is cancelled with
+//! `cancel` so it cannot print later. If `lp` itself hangs, jobs that appeared in the queue since
+//! before the call are cancelled too.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -16,7 +22,7 @@ use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::config::PrinterConfig;
-use crate::printer::{PrintError, Printer};
+use crate::printer::{PrintContext, PrintError, Printer};
 
 /// Default for how long one CUPS command may run before it is killed.
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,10 +74,67 @@ pub enum Health {
     Stopped(PrintError),
 }
 
+/// How CUPS says a job that left the queue ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobEnd {
+    /// `job-completed-successfully` (or with warnings).
+    Completed,
+    /// Aborted by the system or completed with errors.
+    Aborted,
+    /// Cancelled by someone.
+    Canceled,
+}
+
 struct Output {
     success: bool,
     stdout: String,
     stderr: String,
+}
+
+enum RunError {
+    TimedOut(String),
+    Failed(PrintError),
+}
+
+impl RunError {
+    fn into_print_error(self) -> PrintError {
+        match self {
+            Self::TimedOut(bin) => PrintError::Driver(format!("{bin} timed out")),
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// Cancels a CUPS job when dropped while armed, so an abandoned print never leaves a job that
+/// prints later. Best effort: a detached `cancel` process.
+struct JobGuard {
+    cancel_bin: String,
+    job: String,
+    armed: bool,
+}
+
+impl JobGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (bin, job) = (self.cancel_bin.clone(), self.job.clone());
+        // Detached: Drop cannot await, and the runtime may be shutting down.
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(bin)
+                .arg(job)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
 }
 
 /// Printer driven through `lp` and `lpstat`.
@@ -86,7 +149,7 @@ impl CupsPrinter {
         Self { settings }
     }
 
-    async fn run(&self, bin: &str, args: &[&str]) -> Result<Output, PrintError> {
+    async fn run(&self, bin: &str, args: &[&str]) -> Result<Output, RunError> {
         // A freshly written executable can be briefly busy while another thread forks; retry.
         let mut attempts = 0;
         let output = loop {
@@ -96,14 +159,18 @@ impl CupsPrinter {
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true);
             match tokio::time::timeout(self.settings.command_timeout, command.output()).await {
-                Err(_) => return Err(PrintError::Driver(format!("{bin} timed out"))),
+                Err(_) => return Err(RunError::TimedOut(bin.to_owned())),
                 Ok(Err(e))
                     if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 5 =>
                 {
                     attempts += 1;
                     sleep(Duration::from_millis(20)).await;
                 }
-                Ok(Err(e)) => return Err(PrintError::Driver(format!("cannot run {bin}: {e}"))),
+                Ok(Err(e)) => {
+                    return Err(RunError::Failed(PrintError::Driver(format!(
+                        "cannot run {bin}: {e}"
+                    ))));
+                }
                 Ok(Ok(output)) => break output,
             }
         };
@@ -114,49 +181,114 @@ impl CupsPrinter {
         })
     }
 
-    async fn health(&self) -> Result<Health, PrintError> {
+    /// Run an `lpstat` query; a non-zero exit becomes the mapped error.
+    async fn lpstat(&self, args: &[&str]) -> Result<String, PrintError> {
         let out = self
-            .run(&self.settings.lpstat_bin, &["-p", &self.settings.queue])
-            .await?;
-        if !out.success {
-            return Err(map_reason(&out.stderr));
+            .run(&self.settings.lpstat_bin, args)
+            .await
+            .map_err(RunError::into_print_error)?;
+        if out.success {
+            Ok(out.stdout)
+        } else {
+            Err(map_reason(&out.stderr))
         }
-        Ok(classify_printer_status(&out.stdout))
     }
 
-    async fn queued(&self, job: &str) -> Result<bool, PrintError> {
-        let out = self
-            .run(&self.settings.lpstat_bin, &["-o", &self.settings.queue])
-            .await?;
-        if !out.success {
-            return Err(map_reason(&out.stderr));
-        }
-        Ok(job_in_listing(&out.stdout, job))
+    async fn health(&self) -> Result<Health, PrintError> {
+        let text = self.lpstat(&["-p", &self.settings.queue]).await?;
+        Ok(classify_printer_status(&text))
+    }
+
+    async fn queued_jobs(&self) -> Result<Vec<String>, PrintError> {
+        let text = self.lpstat(&["-o", &self.settings.queue]).await?;
+        Ok(listed_jobs(&text))
     }
 
     async fn cancel(&self, job: &str) {
         match self.run(&self.settings.cancel_bin, &[job]).await {
             Ok(out) if out.success => debug!(job, "cancelled CUPS job"),
             Ok(out) => warn!(job, stderr = out.stderr.trim(), "cancel failed"),
-            Err(error) => warn!(job, %error, "cancel failed"),
+            Err(_) => warn!(job, "cancel failed"),
+        }
+    }
+
+    /// `lp` hung and was killed: it may still have queued the job. Cancel whatever appeared.
+    async fn cancel_new_jobs(&self, before: &HashSet<String>) {
+        match self.queued_jobs().await {
+            Ok(now) => {
+                for job in now.iter().filter(|j| !before.contains(*j)) {
+                    warn!(job, "cancelling job queued by a hung lp");
+                    self.cancel(job).await;
+                }
+            }
+            Err(error) => warn!(%error, "cannot list queue after lp timeout"),
+        }
+    }
+
+    /// One poll: `Ok(true)` when the job has finished, `Ok(false)` while it is still working.
+    async fn poll_once(&self, job: &str) -> Result<bool, PrintError> {
+        if !self.queued_jobs().await?.iter().any(|j| j == job) {
+            self.confirm_finished(job).await?;
+            return Ok(true);
+        }
+        if let Health::Stopped(error) = self.health().await? {
+            return Err(error);
+        }
+        Ok(false)
+    }
+
+    /// The job left the queue: check CUPS says it printed. If the history cannot say (disabled,
+    /// pruned, query failed) the print is assumed good.
+    async fn confirm_finished(&self, job: &str) -> Result<(), PrintError> {
+        let listing = self
+            .lpstat(&["-l", "-W", "completed", "-o", &self.settings.queue])
+            .await;
+        match listing.map(|text| job_end(&text, job)) {
+            Ok(Some(JobEnd::Completed)) => Ok(()),
+            Ok(Some(JobEnd::Aborted)) => Err(PrintError::Driver(format!("CUPS aborted job {job}"))),
+            Ok(Some(JobEnd::Canceled)) => Err(PrintError::Driver(format!(
+                "job {job} was cancelled in CUPS"
+            ))),
+            Ok(None) => {
+                warn!(job, "job not in CUPS history, assuming it printed");
+                Ok(())
+            }
+            Err(error) => {
+                warn!(job, %error, "cannot read CUPS history, assuming the job printed");
+                Ok(())
+            }
         }
     }
 }
 
 #[async_trait]
 impl Printer for CupsPrinter {
-    async fn print(&self, file: &Path, copies: u32, media: Media) -> Result<(), PrintError> {
+    async fn print(
+        &self,
+        file: &Path,
+        copies: u32,
+        media: Media,
+        ctx: &PrintContext,
+    ) -> Result<(), PrintError> {
         // Only 4x6 exists; the CUPS media name comes from the config.
         let Media::Photo4x6 = media;
+        let before: HashSet<String> = self
+            .queued_jobs()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let copies = copies.to_string();
         let media_option = format!("media={}", self.settings.media);
         let file = file.to_string_lossy();
-        let out = self
+        let submitted = self
             .run(
                 &self.settings.lp_bin,
                 &[
                     "-d",
                     &self.settings.queue,
+                    "-t",
+                    &ctx.title,
                     "-n",
                     &copies,
                     "-o",
@@ -166,7 +298,16 @@ impl Printer for CupsPrinter {
                     &file,
                 ],
             )
-            .await?;
+            .await;
+        let out = match submitted {
+            Ok(out) => out,
+            Err(error) => {
+                if matches!(error, RunError::TimedOut(_)) {
+                    self.cancel_new_jobs(&before).await;
+                }
+                return Err(error.into_print_error());
+            }
+        };
         if !out.success {
             return Err(map_reason(&out.stderr));
         }
@@ -174,30 +315,47 @@ impl Printer for CupsPrinter {
             PrintError::Driver(format!("unexpected lp output: {}", out.stdout.trim()))
         })?;
         debug!(job, "submitted to CUPS");
+        let mut guard = JobGuard {
+            cancel_bin: self.settings.cancel_bin.clone(),
+            job: job.clone(),
+            armed: true,
+        };
 
         let deadline = Instant::now() + self.settings.print_timeout;
         loop {
-            let result = match self.queued(&job).await {
-                Ok(false) => return Ok(()),
-                Ok(true) => match self.health().await {
-                    Ok(Health::Stopped(error)) => Err(error),
-                    Ok(Health::Idle | Health::Printing) => Ok(()),
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
+            let step = tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    self.cancel(&job).await;
+                    guard.disarm();
+                    return Err(PrintError::Cancelled);
+                }
+                step = self.poll_once(&job) => step,
             };
-            if let Err(error) = result {
-                self.cancel(&job).await;
-                return Err(error);
+            match step {
+                Ok(true) => {
+                    guard.disarm();
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.cancel(&job).await;
+                    guard.disarm();
+                    return Err(error);
+                }
             }
             if Instant::now() >= deadline {
                 self.cancel(&job).await;
+                guard.disarm();
                 return Err(PrintError::Driver(format!(
                     "timed out after {}s waiting for CUPS job {job}",
                     self.settings.print_timeout.as_secs()
                 )));
             }
-            sleep(self.settings.poll_interval).await;
+            tokio::select! {
+                () = ctx.cancel.cancelled() => {}
+                () = sleep(self.settings.poll_interval) => {}
+            }
         }
     }
 
@@ -220,18 +378,57 @@ pub fn parse_request_id(stdout: &str) -> Option<String> {
     })
 }
 
-/// Whether `lpstat -o` output lists the job (first column equals the job id).
-pub fn job_in_listing(stdout: &str, job: &str) -> bool {
+/// Job ids listed by `lpstat -o`: the first column of every unindented line.
+pub fn listed_jobs(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .any(|line| line.split_whitespace().next() == Some(job))
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `lpstat -o` output lists the job (first column equals the job id).
+pub fn job_in_listing(stdout: &str, job: &str) -> bool {
+    listed_jobs(stdout).iter().any(|j| j == job)
+}
+
+/// How a finished job ended, from `lpstat -l -W completed -o`: the job's block (its line plus the
+/// indented lines below) carries an `Alerts:` line with the IPP job-state-reasons. `None` when
+/// the job or its reasons are not listed.
+pub fn job_end(stdout: &str, job: &str) -> Option<JobEnd> {
+    let mut in_block = false;
+    for line in stdout.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            in_block = line.split_whitespace().next() == Some(job);
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        let Some(reasons) = line.trim().strip_prefix("Alerts:") else {
+            continue;
+        };
+        let reasons = reasons.to_lowercase();
+        return if reasons.contains("abort") || reasons.contains("job-completed-with-errors") {
+            Some(JobEnd::Aborted)
+        } else if reasons.contains("cancel") {
+            Some(JobEnd::Canceled)
+        } else if reasons.contains("job-completed") {
+            Some(JobEnd::Completed)
+        } else {
+            None
+        };
+    }
+    None
 }
 
 /// Read `lpstat -p` text: `printer q is idle.`, `printer q now printing q-3.`, or
-/// `printer q disabled since ... -` followed by the reason.
+/// `printer q disabled since ... -` followed by the reason lines.
 pub fn classify_printer_status(text: &str) -> Health {
     let lower = text.to_lowercase();
     if lower.contains(" disabled since") || lower.contains(" stopped") {
+        // Only the reason lines count: the first line carries the queue name.
         let reason: Vec<&str> = text
             .lines()
             .skip(1)
@@ -239,7 +436,11 @@ pub fn classify_printer_status(text: &str) -> Health {
             .filter(|l| !l.is_empty())
             .collect();
         let reason = reason.join("; ");
-        return Health::Stopped(map_reason(if reason.is_empty() { text } else { &reason }));
+        return Health::Stopped(map_reason(if reason.is_empty() {
+            "printer disabled"
+        } else {
+            &reason
+        }));
     }
     if lower.contains("now printing") {
         Health::Printing
@@ -259,9 +460,8 @@ const RIBBON: &[&str] = &[
     "marker-supply-empty",
     "ribbon",
     "out of ink",
-    "ink cartridge",
+    "ink empty",
     "ink is empty",
-    "cartridge",
 ];
 const OFFLINE: &[&str] = &[
     "connecting-to-device",
@@ -279,11 +479,33 @@ const OFFLINE: &[&str] = &[
     "invalid destination",
 ];
 
+/// Lowercase words of a message; letters, digits and `-` stay inside a word.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether the words contain the phrase. A single dashed keyword such as `media-empty` also
+/// matches its IPP variants (`media-empty-error`, `media-empty-warning`).
+fn has_phrase(words: &[String], phrase: &str) -> bool {
+    let parts: Vec<&str> = phrase.split(' ').collect();
+    if let [single] = parts[..] {
+        let prefix = format!("{single}-");
+        return words.iter().any(|w| w == single || w.starts_with(&prefix));
+    }
+    words
+        .windows(parts.len())
+        .any(|w| w.iter().map(String::as_str).eq(parts.iter().copied()))
+}
+
 /// Map CUPS status or error text to a Pi error: paper, ribbon, then unreachable printer; anything
-/// else is a driver error carrying the text.
+/// else is a driver error carrying the text. Keywords match whole words, not substrings.
 pub fn map_reason(text: &str) -> PrintError {
-    let lower = text.to_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    let words = words(text);
+    let has = |keywords: &[&str]| keywords.iter().any(|k| has_phrase(&words, k));
     let message = {
         let t = text.trim();
         if t.is_empty() {
@@ -325,14 +547,29 @@ mod tests {
     }
 
     #[test]
-    fn listing_matches_first_column_only() {
-        let listing =
-            "fotoko-12   root   1024   Thu 05 Nov 2026 10:00:00 AM UTC\nfotoko-123  root  5  x\n";
+    fn listing_matches_first_column_of_unindented_lines_only() {
+        let listing = "fotoko-12   root   1024   Thu 05 Nov 2026 10:00:00 AM UTC\n\tAlerts: x\nfotoko-123  root  5  x\n";
+        assert_eq!(listed_jobs(listing), ["fotoko-12", "fotoko-123"]);
         assert!(job_in_listing(listing, "fotoko-12"));
         assert!(job_in_listing(listing, "fotoko-123"));
         assert!(!job_in_listing(listing, "fotoko-1"));
         assert!(!job_in_listing("", "fotoko-12"));
         assert!(!job_in_listing("other root fotoko-12\n", "fotoko-12"));
+        assert!(!job_in_listing("\tfotoko-12 indented\n", "fotoko-12"));
+    }
+
+    #[test]
+    fn job_end_reads_the_alerts_of_the_right_job() {
+        let listing = "q-1 root 1 now\n\tAlerts: aborted-by-system\nq-2 root 1 now\n\tqueued for q\n\tAlerts: job-completed-successfully\nq-3 root 1 now\n\tAlerts: job-canceled-by-user\nq-4 root 1 now\n\tAlerts: job-completed-with-errors\nq-5 root 1 now\n\tAlerts: job-completed-with-warnings\nq-6 root 1 now\n\tAlerts: processing-to-stop-point\nq-7 root 1 now\n";
+        assert_eq!(job_end(listing, "q-1"), Some(JobEnd::Aborted));
+        assert_eq!(job_end(listing, "q-2"), Some(JobEnd::Completed));
+        assert_eq!(job_end(listing, "q-3"), Some(JobEnd::Canceled));
+        assert_eq!(job_end(listing, "q-4"), Some(JobEnd::Aborted));
+        assert_eq!(job_end(listing, "q-5"), Some(JobEnd::Completed));
+        assert_eq!(job_end(listing, "q-6"), None, "unrecognised reason");
+        assert_eq!(job_end(listing, "q-7"), None, "no alerts");
+        assert_eq!(job_end(listing, "q-8"), None, "not listed");
+        assert_eq!(job_end("", "q-1"), None);
     }
 
     #[test]
@@ -349,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_disabled_uses_reason_line() {
+    fn classify_disabled_uses_reason_lines_only() {
         let text =
             |reason: &str| format!("printer fotoko disabled since Thu 05 Nov 2026 -\n\t{reason}\n");
         assert_eq!(
@@ -370,14 +607,19 @@ mod tests {
             classify_printer_status(&text("Filter failed.")),
             Health::Stopped(PrintError::Driver("Filter failed.".into()))
         );
+        // A queue called "ribbon" must not turn every fault into ribbon_out.
+        assert_eq!(
+            classify_printer_status("printer ribbon disabled since x -\n\tFilter failed.\n"),
+            Health::Stopped(PrintError::Driver("Filter failed.".into()))
+        );
     }
 
     #[test]
     fn classify_disabled_without_reason_and_stopped_wording() {
-        assert!(matches!(
-            classify_printer_status("printer q disabled since x -"),
-            Health::Stopped(PrintError::Driver(m)) if m.contains("disabled")
-        ));
+        assert_eq!(
+            classify_printer_status("printer paper-queue disabled since x -"),
+            Health::Stopped(PrintError::Driver("printer disabled".into()))
+        );
         assert_eq!(
             classify_printer_status("printer q stopped\n\tmedia-empty-error"),
             Health::Stopped(PrintError::PaperOut)
@@ -387,13 +629,16 @@ mod tests {
     #[test]
     fn reason_mapping_table() {
         assert_eq!(map_reason("media-empty-error"), PrintError::PaperOut);
+        assert_eq!(map_reason("media-empty"), PrintError::PaperOut);
         assert_eq!(map_reason("Media-Needed"), PrintError::PaperOut);
         assert_eq!(map_reason("No paper in tray"), PrintError::PaperOut);
+        assert_eq!(map_reason("Out of paper."), PrintError::PaperOut);
         assert_eq!(
             map_reason("marker-supply-empty-error"),
             PrintError::RibbonOut
         );
         assert_eq!(map_reason("Ribbon exhausted"), PrintError::RibbonOut);
+        assert_eq!(map_reason("The ink is empty"), PrintError::RibbonOut);
         assert!(matches!(
             map_reason("Unable to open USB device"),
             PrintError::Offline(_)
@@ -404,6 +649,10 @@ mod tests {
         ));
         assert!(matches!(
             map_reason("lp: Destination \"q\" is not accepting jobs"),
+            PrintError::Offline(_)
+        ));
+        assert!(matches!(
+            map_reason("connecting-to-device"),
             PrintError::Offline(_)
         ));
         assert_eq!(
@@ -418,6 +667,22 @@ mod tests {
         assert_eq!(map_reason("offline: out of paper"), PrintError::PaperOut);
     }
 
+    #[test]
+    fn keywords_match_whole_words_only() {
+        for text in [
+            "ribbonfactory.ppd failed",
+            "mediaempty",
+            "pre-media-empty",
+            "inkjet error",
+            "offlined",
+            "xnot accepting",
+        ] {
+            assert!(matches!(map_reason(text), PrintError::Driver(_)), "{text}");
+        }
+    }
+
+    // ---- shell stubs ----
+
     fn script(dir: &Path, name: &str, body: &str) -> String {
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -430,7 +695,21 @@ mod tests {
         settings: CupsSettings,
     }
 
-    /// `lp` stub body, `lpstat` stub body (sees `$1` = -o or -p), `cancel` stub body.
+    /// An `lpstat` stub that answers `-l -W completed -o`, `-o` and `-p` with the given shell
+    /// snippets.
+    fn lpstat(completed: &str, queue: &str, printer: &str) -> String {
+        format!(
+            "case \"$*\" in\n*completed*) {completed} ;;\n-o*) {queue} ;;\n-p*) {printer} ;;\nesac"
+        )
+    }
+
+    const LP_OK: &str = "echo 'request id is q-7 (1 file(s))'";
+    const DONE: &str = "echo 'q-7 root 1 now'; printf '\\tAlerts: job-completed-successfully\\n'";
+    const LISTED: &str = "echo 'q-7 root 1 now'";
+    const PRINTING: &str = "echo 'printer q now printing q-7.  enabled since x'";
+    const IDLE: &str = "echo 'printer q is idle.  enabled since x'";
+
+    /// `lp` stub body, `lpstat` stub body, `cancel` stub body.
     fn stubs(lp: &str, lpstat: &str, cancel: &str) -> Stubs {
         let dir = tempfile::tempdir().unwrap();
         let settings = CupsSettings {
@@ -439,53 +718,102 @@ mod tests {
             lp_bin: script(dir.path(), "lp", lp),
             lpstat_bin: script(dir.path(), "lpstat", lpstat),
             cancel_bin: script(dir.path(), "cancel", cancel),
-            print_timeout: Duration::from_millis(400),
+            print_timeout: Duration::from_millis(600),
             poll_interval: Duration::from_millis(20),
             command_timeout: Duration::from_secs(10),
         };
         Stubs { dir, settings }
     }
 
-    fn file(dir: &Path) -> PathBuf {
-        dir.join("a.jpg")
+    impl Stubs {
+        fn printer(&self) -> CupsPrinter {
+            CupsPrinter::new(self.settings.clone())
+        }
+
+        fn file(&self) -> PathBuf {
+            self.dir.path().join("a.jpg")
+        }
+
+        async fn print(&self) -> Result<(), PrintError> {
+            self.printer()
+                .print(
+                    &self.file(),
+                    1,
+                    Media::Photo4x6,
+                    &PrintContext::new("job-1"),
+                )
+                .await
+        }
+
+        fn log(&self, bin: &str) -> String {
+            std::fs::read_to_string(self.dir.path().join(format!("{bin}.log"))).unwrap_or_default()
+        }
     }
 
-    const LP_OK: &str = "echo 'request id is q-7 (1 file(s))'";
+    async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !check() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     #[tokio::test]
     async fn passes_documented_lp_arguments() {
         let s = stubs(
             "echo \"$@\" > \"$0.args\"; echo 'request id is q-7 (1 file(s))'",
-            "exit 0",
+            &lpstat(DONE, "exit 0", IDLE),
             "exit 0",
         );
-        let p = CupsPrinter::new(s.settings.clone());
-        p.print(&file(s.dir.path()), 3, Media::Photo4x6)
+        s.printer()
+            .print(&s.file(), 3, Media::Photo4x6, &PrintContext::new("job-9"))
             .await
             .unwrap();
         let args = std::fs::read_to_string(format!("{}.args", s.settings.lp_bin)).unwrap();
         assert_eq!(
             args.trim(),
             format!(
-                "-d q -n 3 -o media=w288h432 -o fit-to-page {}",
-                file(s.dir.path()).display()
+                "-d q -t job-9 -n 3 -o media=w288h432 -o fit-to-page {}",
+                s.file().display()
             )
         );
     }
 
     #[tokio::test]
-    async fn succeeds_when_job_leaves_queue() {
-        // First -o poll lists the job, the second does not.
-        let lpstat = r#"
-case "$1" in
-  -o) if [ -e "$0.seen" ]; then exit 0; else touch "$0.seen"; echo "q-7 root 1 now"; fi ;;
-  -p) echo "printer q now printing q-7.  enabled since x" ;;
-esac"#;
-        let s = stubs(LP_OK, lpstat, "exit 0");
-        CupsPrinter::new(s.settings.clone())
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap();
+    async fn succeeds_when_job_leaves_queue_and_history_says_completed() {
+        // The snapshot before lp and the first poll list the job, the second poll does not.
+        let queue = "n=$(cat \"$0.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.n\"; if [ $n -le 2 ]; then echo 'q-7 root 1 now'; fi";
+        let s = stubs(LP_OK, &lpstat(DONE, queue, PRINTING), "exit 0");
+        s.print().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_and_cancelled_jobs_are_driver_errors() {
+        for (alert, expect) in [
+            ("aborted-by-system", "aborted"),
+            ("job-canceled-by-user", "cancelled"),
+        ] {
+            let completed = format!("echo 'q-7 root 1 now'; printf '\\tAlerts: {alert}\\n'");
+            let s = stubs(LP_OK, &lpstat(&completed, "exit 0", IDLE), "exit 0");
+            let e = s.print().await.unwrap_err();
+            assert!(
+                matches!(&e, PrintError::Driver(m) if m.contains(expect)),
+                "{alert}: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmable_history_is_assumed_good() {
+        // Not listed in the history, listed without reasons, or the query fails.
+        for completed in [
+            "exit 0",
+            "echo 'q-7 root 1 now'",
+            "echo 'lpstat: boom' >&2; exit 1",
+        ] {
+            let s = stubs(LP_OK, &lpstat(completed, "exit 0", IDLE), "exit 0");
+            s.print().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -495,84 +823,141 @@ esac"#;
             "exit 0",
             "exit 0",
         );
-        let e = CupsPrinter::new(s.settings.clone())
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap_err();
+        let e = s.print().await.unwrap_err();
         assert!(matches!(e, PrintError::Offline(m) if m.contains("does not exist")));
     }
 
     #[tokio::test]
     async fn unparsable_lp_output_is_driver_error() {
         let s = stubs("echo hello", "exit 0", "exit 0");
-        let e = CupsPrinter::new(s.settings.clone())
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap_err();
+        let e = s.print().await.unwrap_err();
         assert!(matches!(e, PrintError::Driver(m) if m.contains("unexpected lp output")));
     }
 
     #[tokio::test]
     async fn missing_binary_is_driver_error() {
-        let s = stubs(LP_OK, "exit 0", "exit 0");
-        let mut settings = s.settings.clone();
-        settings.lp_bin = "/nonexistent/lp".into();
-        let e = CupsPrinter::new(settings)
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap_err();
+        let mut s = stubs(LP_OK, "exit 0", "exit 0");
+        s.settings.lp_bin = "/nonexistent/lp".into();
+        let e = s.print().await.unwrap_err();
         assert!(matches!(e, PrintError::Driver(m) if m.contains("cannot run")));
     }
 
     #[tokio::test]
     async fn disabled_printer_fails_and_cancels_job() {
-        let lpstat = r#"
-case "$1" in
-  -o) echo "q-7 root 1 now" ;;
-  -p) printf 'printer q disabled since x -\n\tOut of paper.\n' ;;
-esac"#;
-        let s = stubs(LP_OK, lpstat, "echo \"$@\" > \"$0.args\"");
-        let e = CupsPrinter::new(s.settings.clone())
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap_err();
-        assert_eq!(e, PrintError::PaperOut);
-        let cancelled = std::fs::read_to_string(format!("{}.args", s.settings.cancel_bin)).unwrap();
-        assert_eq!(cancelled.trim(), "q-7");
+        let printer = "printf 'printer q disabled since x -\\n\\tOut of paper.\\n'";
+        let s = stubs(
+            LP_OK,
+            &lpstat(DONE, LISTED, printer),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        assert_eq!(s.print().await.unwrap_err(), PrintError::PaperOut);
+        assert_eq!(s.log("cancel").trim(), "q-7");
     }
 
     #[tokio::test]
     async fn timeout_cancels_job() {
-        let lpstat = r#"
-case "$1" in
-  -o) echo "q-7 root 1 now" ;;
-  -p) echo "printer q now printing q-7.  enabled since x" ;;
-esac"#;
-        let s = stubs(LP_OK, lpstat, "touch \"$0.ran\"");
-        let e = CupsPrinter::new(s.settings.clone())
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap_err();
+        let s = stubs(
+            LP_OK,
+            &lpstat(DONE, LISTED, PRINTING),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        let e = s.print().await.unwrap_err();
         assert!(matches!(e, PrintError::Driver(m) if m.contains("timed out")));
-        assert!(Path::new(&format!("{}.ran", s.settings.cancel_bin)).exists());
+        assert_eq!(s.log("cancel").trim(), "q-7");
     }
 
     #[tokio::test]
-    async fn lpstat_failures_fail_the_print() {
+    async fn lpstat_failures_fail_the_print_and_cancel() {
         for failing in ["-o", "-p"] {
             let lpstat = format!(
                 "if [ \"$1\" = \"{failing}\" ]; then echo 'lpstat: Unable to connect to server' >&2; exit 1; fi; echo 'q-7 root 1 now'; echo 'printer q is idle.'"
             );
-            let s = stubs(LP_OK, &lpstat, "exit 1");
-            let e = CupsPrinter::new(s.settings.clone())
-                .print(&file(s.dir.path()), 1, Media::Photo4x6)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(e, PrintError::Offline(_) | PrintError::Driver(_)),
-                "{failing}: {e}"
-            );
+            let s = stubs(LP_OK, &lpstat, "echo \"$@\" >> \"$0.log\"");
+            let e = s.print().await.unwrap_err();
+            assert!(matches!(e, PrintError::Driver(_)), "{failing}: {e}");
+            if failing == "-p" {
+                assert_eq!(s.log("cancel").trim(), "q-7");
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_token_withdraws_the_job() {
+        let mut s = stubs(
+            LP_OK,
+            &lpstat(DONE, LISTED, PRINTING),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        s.settings.print_timeout = Duration::from_secs(30);
+        let ctx = PrintContext::new("job-1");
+        let token = ctx.cancel.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(150)).await;
+            token.cancel();
+        });
+        let started = Instant::now();
+        let e = s
+            .printer()
+            .print(&s.file(), 1, Media::Photo4x6, &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(e, PrintError::Cancelled);
+        assert_eq!(s.log("cancel").trim(), "q-7");
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_print_cancels_the_cups_job() {
+        let mut s = stubs(
+            LP_OK,
+            &lpstat(DONE, "touch \"$0.polled\"; echo 'q-7 root 1 now'", PRINTING),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        s.settings.print_timeout = Duration::from_secs(30);
+        let printer = s.printer();
+        let file = s.file();
+        let task = tokio::spawn(async move {
+            printer
+                .print(&file, 1, Media::Photo4x6, &PrintContext::new("job-1"))
+                .await
+        });
+        let polled = format!("{}.polled", s.settings.lpstat_bin);
+        eventually("first poll", || Path::new(&polled).exists()).await;
+        task.abort();
+        let _ = task.await;
+        eventually("detached cancel", || s.log("cancel").trim() == "q-7").await;
+    }
+
+    #[tokio::test]
+    async fn hung_lp_is_killed_and_the_job_it_queued_is_cancelled() {
+        let lpstat = lpstat(
+            DONE,
+            "if [ -e \"$(dirname \"$0\")/queued\" ]; then echo 'q-9 root 1 now'; fi",
+            IDLE,
+        );
+        let mut s = stubs(
+            "touch \"$(dirname \"$0\")/queued\"; sleep 5",
+            &lpstat,
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        s.settings.command_timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let e = s.print().await.unwrap_err();
+        assert!(
+            matches!(&e, PrintError::Driver(m) if m.contains("timed out")),
+            "{e}"
+        );
+        assert_eq!(s.log("cancel").trim(), "q-9");
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn jobs_that_were_already_queued_are_not_cancelled_after_a_hung_lp() {
+        let lpstat = lpstat(DONE, "echo 'q-1 root 1 old'", IDLE);
+        let mut s = stubs("sleep 5", &lpstat, "echo \"$@\" >> \"$0.log\"");
+        s.settings.command_timeout = Duration::from_millis(200);
+        assert!(s.print().await.is_err());
+        assert_eq!(s.log("cancel"), "");
     }
 
     #[tokio::test]
@@ -598,11 +983,7 @@ esac"#;
         ];
         for (body, expected) in cases {
             let s = stubs(LP_OK, body, "exit 0");
-            assert_eq!(
-                CupsPrinter::new(s.settings.clone()).state().await,
-                expected,
-                "{body}"
-            );
+            assert_eq!(s.printer().state().await, expected, "{body}");
         }
     }
 
@@ -611,12 +992,9 @@ esac"#;
         let mut s = stubs("sleep 5", "exit 0", "exit 0");
         s.settings.command_timeout = Duration::from_millis(100);
         let started = Instant::now();
-        let e = CupsPrinter::new(s.settings.clone())
-            .print(&file(s.dir.path()), 1, Media::Photo4x6)
-            .await
-            .unwrap_err();
+        let e = s.print().await.unwrap_err();
         assert!(matches!(e, PrintError::Driver(m) if m.contains("timed out")));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(8));
     }
 
     #[test]

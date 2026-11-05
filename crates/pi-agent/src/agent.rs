@@ -10,6 +10,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fotoko_protocol::{MAX_PHOTO_BYTES, PrinterId, PrinterState, jobs_topic};
@@ -23,8 +24,9 @@ use tracing::{debug, info, warn};
 use crate::config::{Backend, Config};
 use crate::cups::{CupsPrinter, CupsSettings};
 use crate::dedupe::{DedupeStore, StoreError};
+use crate::download::UrlPolicy;
 use crate::download::{DownloadError, Downloader};
-use crate::handler::JobHandler;
+use crate::handler::{JobHandler, reject};
 use crate::mqtt::{MqttError, MqttSink, Sink, heartbeat, mqtt_options};
 use crate::printer::{PrintError, Printer};
 use crate::sim_backend::SimBackend;
@@ -59,6 +61,10 @@ const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Time given to flush the final messages before the connection is dropped.
 const DISCONNECT_WAIT: Duration = Duration::from_secs(5);
+/// Time a cancelled job gets to report itself failed.
+const CANCEL_WAIT: Duration = Duration::from_secs(10);
+/// Jobs waiting for the worker; more are rejected with `failed`.
+pub const JOB_QUEUE: usize = 32;
 
 /// Build the printer a config asks for.
 pub fn build_printer(config: &Config) -> Result<Arc<dyn Printer>, PrintError> {
@@ -111,46 +117,58 @@ impl Agent {
         let state_dir = &config.storage.state_dir;
         let tmp_dir = state_dir.join("tmp");
         prepare_tmp_dir(&tmp_dir)?;
-        let dedupe = DedupeStore::open(state_dir)?;
+        let store = DedupeStore::open(state_dir)?;
+        let policy = if config.storage.allow_insecure_http {
+            UrlPolicy::permissive()
+        } else {
+            UrlPolicy::strict(config.storage.allowed_hosts.clone())
+        };
         let downloader = Downloader::new(
-            config.storage.allow_insecure_http,
+            policy,
             MAX_PHOTO_BYTES,
             Duration::from_secs(config.agent.download_timeout_secs),
         )?;
         let options = mqtt_options(&config)?;
         let (client, eventloop) = AsyncClient::new(options, 64);
         let sink: Arc<dyn Sink> = Arc::new(MqttSink::new(client.clone(), &config.printer_id));
+        let job_cancel = CancellationToken::new();
         let handler = JobHandler::new(
             config.printer_id.clone(),
             Arc::clone(&printer),
             Arc::clone(&sink),
             downloader,
-            dedupe,
+            store,
             tmp_dir,
+            job_cancel.clone(),
         );
 
         let stop = CancellationToken::new();
         let net_stop = CancellationToken::new();
         let connected = Arc::new(Notify::new());
-        let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
+        let link_up = Arc::new(AtomicBool::new(false));
+        let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE);
 
-        let mut net = tokio::spawn(network_loop(
+        let mut net = tokio::spawn(network_loop(Network {
             eventloop,
-            client.clone(),
-            jobs_topic(&config.printer_id),
-            jobs_tx,
-            Arc::clone(&connected),
-            net_stop.clone(),
-        ));
+            client: client.clone(),
+            jobs_topic: jobs_topic(&config.printer_id),
+            jobs: jobs_tx,
+            connected: Arc::clone(&connected),
+            link_up: Arc::clone(&link_up),
+            sink: Arc::clone(&sink),
+            printer_id: config.printer_id.clone(),
+            stop: net_stop.clone(),
+        }));
         let mut worker = tokio::spawn(worker_loop(handler, jobs_rx, stop.clone()));
-        let beat = tokio::spawn(heartbeat_loop(
-            config.printer_id.clone(),
-            Arc::clone(&printer),
-            Arc::clone(&sink),
-            config.heartbeat_interval(),
+        let beat = tokio::spawn(heartbeat_loop(Heartbeats {
+            printer_id: config.printer_id.clone(),
+            printer: Arc::clone(&printer),
+            sink: Arc::clone(&sink),
+            period: config.heartbeat_interval(),
             connected,
-            stop.clone(),
-        ));
+            link_up,
+            stop: stop.clone(),
+        }));
         // Dropping `run` (for example by aborting its task) must not leave tasks holding the
         // connection open.
         let _guard = AbortOnDrop(vec![
@@ -165,8 +183,13 @@ impl Agent {
         stop.cancel();
         let grace = Duration::from_secs(config.agent.shutdown_grace_secs);
         if timeout(grace, &mut worker).await.is_err() {
-            warn!("job still running after the grace period, abandoning it");
-            worker.abort();
+            // Withdraw the job in progress: it is reported as failed and its CUPS job cancelled.
+            warn!("job still running after the grace period, cancelling it");
+            job_cancel.cancel();
+            if timeout(CANCEL_WAIT, &mut worker).await.is_err() {
+                warn!("job did not stop, abandoning it");
+                worker.abort();
+            }
         }
         let _ = beat.await;
         // Announce `offline` ourselves: a clean DISCONNECT suppresses the last will.
@@ -196,6 +219,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Create `dir` empty with mode 0700 (downloads hold customers' photos).
 fn prepare_tmp_dir(dir: &Path) -> Result<(), AgentError> {
     let err = |source| AgentError::StateDir {
         path: dir.to_owned(),
@@ -205,60 +229,97 @@ fn prepare_tmp_dir(dir: &Path) -> Result<(), AgentError> {
         // Leftovers of a killed run.
         fs::remove_dir_all(dir).map_err(err)?;
     }
-    fs::create_dir_all(dir).map_err(err)
+    fs::create_dir_all(dir).map_err(err)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+    }
+    Ok(())
 }
 
-async fn network_loop(
-    mut eventloop: rumqttc::EventLoop,
+/// `delay` spread by up to +-25% so a fleet of Pis does not reconnect in lockstep.
+fn jittered(delay: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    delay.mul_f64(0.75 + f64::from(nanos % 1000) / 2000.0)
+}
+
+struct Network {
+    eventloop: rumqttc::EventLoop,
     client: AsyncClient,
     jobs_topic: String,
-    jobs: mpsc::UnboundedSender<Vec<u8>>,
+    jobs: mpsc::Sender<Vec<u8>>,
     connected: Arc<Notify>,
+    link_up: Arc<AtomicBool>,
+    sink: Arc<dyn Sink>,
+    printer_id: PrinterId,
     stop: CancellationToken,
-) {
+}
+
+async fn network_loop(mut net: Network) {
     let mut backoff = MIN_BACKOFF;
     loop {
         let event = tokio::select! {
             biased;
-            () = stop.cancelled() => break,
-            event = eventloop.poll() => event,
+            () = net.stop.cancelled() => break,
+            event = net.eventloop.poll() => event,
         };
         match event {
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 info!("connected to broker");
                 backoff = MIN_BACKOFF;
-                if let Err(error) = client.try_subscribe(&jobs_topic, QoS::AtLeastOnce) {
+                net.link_up.store(true, Ordering::SeqCst);
+                if let Err(error) = net.client.try_subscribe(&net.jobs_topic, QoS::AtLeastOnce) {
                     warn!(%error, "cannot subscribe to jobs topic");
                 }
-                connected.notify_one();
+                net.connected.notify_one();
             }
             Ok(Event::Incoming(Incoming::Publish(publish))) => {
-                if publish.topic == jobs_topic {
-                    // The receiver only disappears during shutdown.
-                    let _ = jobs.send(publish.payload.to_vec());
-                } else {
+                if publish.topic != net.jobs_topic {
                     debug!(topic = %publish.topic, "ignoring message on unexpected topic");
+                    continue;
+                }
+                let payload = publish.payload.to_vec();
+                match net.jobs.try_send(payload) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(payload)) => {
+                        warn!("job queue full, rejecting job");
+                        // Publishing may wait for this very loop to drain the request queue, so
+                        // it happens in its own task.
+                        let (sink, id) = (Arc::clone(&net.sink), net.printer_id.clone());
+                        tokio::spawn(async move {
+                            reject(sink.as_ref(), &id, &payload, "queue full").await;
+                        });
+                    }
+                    // The worker only goes away during shutdown.
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                 }
             }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => break,
             Ok(_) => {}
             Err(error) => {
-                warn!(%error, retry_in = ?backoff, "mqtt connection error");
+                net.link_up.store(false, Ordering::SeqCst);
+                let wait = jittered(backoff);
+                warn!(%error, retry_in = ?wait, "mqtt connection error");
                 tokio::select! {
-                    () = stop.cancelled() => break,
-                    () = sleep(backoff) => {}
+                    () = net.stop.cancelled() => break,
+                    () = sleep(wait) => {}
                 }
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
     }
+    net.link_up.store(false, Ordering::SeqCst);
 }
 
 async fn worker_loop(
     mut handler: JobHandler,
-    mut jobs: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut jobs: mpsc::Receiver<Vec<u8>>,
     stop: CancellationToken,
 ) {
+    handler.recover().await;
     loop {
         let payload = tokio::select! {
             biased;
@@ -272,25 +333,32 @@ async fn worker_loop(
     }
 }
 
-async fn heartbeat_loop(
+struct Heartbeats {
     printer_id: PrinterId,
     printer: Arc<dyn Printer>,
     sink: Arc<dyn Sink>,
     period: Duration,
     connected: Arc<Notify>,
+    link_up: Arc<AtomicBool>,
     stop: CancellationToken,
-) {
-    let mut ticker = interval_at(Instant::now() + period, period);
+}
+
+async fn heartbeat_loop(beats: Heartbeats) {
+    let mut ticker = interval_at(Instant::now() + beats.period, beats.period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
-            () = stop.cancelled() => break,
+            () = beats.stop.cancelled() => break,
             _ = ticker.tick() => {}
-            () = connected.notified() => {}
+            () = beats.connected.notified() => {}
         }
-        let beat = heartbeat(&printer_id, printer.state().await);
-        if let Err(error) = sink.heartbeat(&beat) {
+        if !beats.link_up.load(Ordering::SeqCst) {
+            // Nobody is listening; do not queue stale heartbeats for the reconnect.
+            continue;
+        }
+        let beat = heartbeat(&beats.printer_id, beats.printer.state().await);
+        if let Err(error) = beats.sink.heartbeat(&beat) {
             warn!(%error, "cannot publish heartbeat");
         }
     }
@@ -346,6 +414,84 @@ mod tests {
         let ok = Agent::from_config(config("cups", false)).unwrap();
         let text = format!("{ok:?}");
         assert!(text.contains("stand-001") && text.contains(".."), "{text}");
+    }
+
+    #[derive(Default)]
+    struct Beats(std::sync::Mutex<Vec<fotoko_protocol::Heartbeat>>);
+
+    #[async_trait::async_trait]
+    impl Sink for Beats {
+        async fn status(&self, _: &fotoko_protocol::JobStatus) -> Result<(), MqttError> {
+            Ok(())
+        }
+
+        fn heartbeat(&self, beat: &fotoko_protocol::Heartbeat) -> Result<(), MqttError> {
+            self.0.lock().unwrap().push(beat.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeats_are_skipped_while_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = config("sim", true);
+        sim.sim.as_mut().unwrap().out_dir = dir.path().join("o");
+        let printer = build_printer(&sim).unwrap();
+        let sink = Arc::new(Beats::default());
+        let (connected, link_up, stop) = (
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
+        );
+        let task = tokio::spawn(heartbeat_loop(Heartbeats {
+            printer_id: sim.printer_id.clone(),
+            printer,
+            sink: sink.clone(),
+            period: Duration::from_millis(30),
+            connected,
+            link_up: Arc::clone(&link_up),
+            stop: stop.clone(),
+        }));
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "nothing while the link is down"
+        );
+        link_up.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sink.0.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no heartbeats after reconnect"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let beat = sink.0.lock().unwrap()[0].clone();
+        assert_eq!(beat.printer_state, PrinterState::Idle);
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn jitter_stays_within_a_quarter() {
+        let base = Duration::from_secs(8);
+        for _ in 0..50 {
+            let d = jittered(base);
+            assert!(d >= base.mul_f64(0.75) && d <= base.mul_f64(1.25), "{d:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        prepare_tmp_dir(&tmp).unwrap();
+        assert_eq!(
+            fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

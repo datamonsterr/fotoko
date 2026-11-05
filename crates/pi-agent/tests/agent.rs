@@ -73,15 +73,15 @@ async fn happy_path_prints_every_copy_and_reports_status() {
     );
 
     assert_eq!(
-        page_size(&agent.out_dir.join("job-1-ph0-1.png")),
+        page_size(&agent.out_dir.join("job-1-0-ph0-1.png")),
         (1800, 1200)
     );
     assert_eq!(
-        page_size(&agent.out_dir.join("job-1-ph0-2.png")),
+        page_size(&agent.out_dir.join("job-1-0-ph0-2.png")),
         (1800, 1200)
     );
     assert_eq!(
-        page_size(&agent.out_dir.join("job-1-ph1-1.png")),
+        page_size(&agent.out_dir.join("job-1-1-ph1-1.png")),
         (1200, 1800)
     );
     assert_eq!(agent.sim.state().paper_remaining, 17);
@@ -196,7 +196,7 @@ async fn jobs_for_another_printer_are_ignored() {
         statuses.iter().all(|s| s.job_id.as_str() == "job-ok"),
         "{statuses:?}"
     );
-    assert!(!agent.out_dir.join("job-x-ph0-1.png").exists());
+    assert!(!agent.out_dir.join("job-x-0-ph0-1.png").exists());
     assert_eq!(agent.sim.state().paper_remaining, 19);
     agent.stop().await.unwrap();
 }
@@ -522,4 +522,194 @@ async fn startup_fails_cleanly_on_an_unusable_state_dir() {
     let agent = start_agent(config, 5, Duration::ZERO);
     let result = agent.stop().await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn jobs_interrupted_by_a_restart_are_reported_failed() {
+    let env = env().await;
+    // A previous run accepted this job and died before finishing it.
+    {
+        let mut ledger = fotoko_pi_agent::dedupe::DedupeStore::open(env.state.path()).unwrap();
+        ledger.begin("job-crashed", "order-job-crashed").unwrap();
+    }
+    let mut cloud = Cloud::connect(env.port).await;
+    let agent = start_agent(
+        agent_config(env.port, env.state.path(), 30),
+        20,
+        Duration::ZERO,
+    );
+    let status = cloud.next_status().await;
+    assert_eq!(status.job_id.as_str(), "job-crashed");
+    assert_eq!(status.order_id.as_str(), "order-job-crashed");
+    assert_eq!(status.state, JobState::Failed);
+    let error = status.error.unwrap();
+    assert_eq!(error.code, PiErrorCode::DriverError);
+    assert_eq!(error.message, "agent restarted during job");
+    cloud.heartbeat_where(PrinterState::Idle).await;
+    // It is closed now: redelivery of that job id is a duplicate.
+    cloud
+        .publish_job(&job(
+            &env.base,
+            "job-crashed",
+            PRINTER,
+            &[("/land.jpg", ContentType::Jpeg, 1)],
+        ))
+        .await;
+    cloud
+        .publish_job(&job(
+            &env.base,
+            "job-next",
+            PRINTER,
+            &[("/land.jpg", ContentType::Jpeg, 1)],
+        ))
+        .await;
+    let statuses = cloud.job_statuses().await;
+    assert!(
+        statuses.iter().all(|s| s.job_id.as_str() == "job-next"),
+        "{statuses:?}"
+    );
+    agent.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_job_that_failed_to_download_can_be_republished_under_the_same_id() {
+    let env = env().await;
+    let (agent, mut cloud) = online(&env, 20).await;
+    let payload = job(
+        &env.base,
+        "job-order-7",
+        PRINTER,
+        &[("/flaky.jpg", ContentType::Jpeg, 1)],
+    );
+    cloud.publish_job(&payload).await;
+    let first = cloud.job_statuses().await;
+    assert_eq!(
+        first.last().unwrap().error.as_ref().unwrap().code,
+        PiErrorCode::DownloadFailed
+    );
+    cloud.publish_job(&payload).await;
+    let second = cloud.job_statuses().await;
+    assert_eq!(second.last().unwrap().state, JobState::Completed);
+    // Completed: now it is a duplicate.
+    cloud.publish_job(&payload).await;
+    cloud
+        .publish_job(&job(
+            &env.base,
+            "job-after",
+            PRINTER,
+            &[("/land.jpg", ContentType::Jpeg, 1)],
+        ))
+        .await;
+    assert!(
+        cloud
+            .job_statuses()
+            .await
+            .iter()
+            .all(|s| s.job_id.as_str() == "job-after")
+    );
+    assert_eq!(agent.sim.state().paper_remaining, 18);
+    agent.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn outside_simulation_mode_private_and_plain_http_urls_are_refused() {
+    let env = env().await;
+    let mut cloud = Cloud::connect(env.port).await;
+    let mut config = agent_config(env.port, env.state.path(), 30);
+    config.storage.allow_insecure_http = false;
+    let agent = start_agent(config, 20, Duration::ZERO);
+    cloud.heartbeat_where(PrinterState::Idle).await;
+    for (id, url) in [
+        ("job-http", format!("{}/land.jpg", env.base)),
+        (
+            "job-meta",
+            "https://169.254.169.254/latest/meta-data".to_owned(),
+        ),
+        ("job-host", "https://evil.example.com/x.jpg".to_owned()),
+    ] {
+        let mut value: serde_json::Value = serde_json::to_value(job(
+            &env.base,
+            id,
+            PRINTER,
+            &[("/land.jpg", ContentType::Jpeg, 1)],
+        ))
+        .unwrap();
+        value["photos"][0]["url"] = url.into();
+        cloud
+            .publish_raw(PRINTER, serde_json::to_vec(&value).unwrap())
+            .await;
+        let statuses = cloud.job_statuses().await;
+        let error = statuses.last().unwrap().error.clone().unwrap();
+        assert_eq!(error.code, PiErrorCode::DownloadFailed, "{id}");
+        assert_eq!(error.message, "download failed", "{id}");
+    }
+    assert_eq!(agent.sim.state().paper_remaining, 20);
+    agent.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_job_still_running_after_the_grace_period_is_cancelled_and_reported() {
+    let env = env().await;
+    let mut cloud = Cloud::connect(env.port).await;
+    let mut config = agent_config(env.port, env.state.path(), 30);
+    config.agent.shutdown_grace_secs = 1;
+    let agent = start_agent(config, 20, Duration::from_secs(4));
+    cloud.heartbeat_where(PrinterState::Idle).await;
+    cloud
+        .publish_job(&job(
+            &env.base,
+            "job-stuck",
+            PRINTER,
+            &[("/land.jpg", ContentType::Jpeg, 1)],
+        ))
+        .await;
+    assert_eq!(cloud.next_status().await.state, JobState::Received);
+    assert_eq!(cloud.next_status().await.state, JobState::Printing);
+    let started = std::time::Instant::now();
+    let stopper = tokio::spawn(agent.stop());
+    let failed = cloud.next_status().await;
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.error.unwrap().code, PiErrorCode::DriverError);
+    stopper.await.unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(15));
+    cloud.heartbeat_where(PrinterState::Offline).await;
+}
+
+#[tokio::test]
+async fn jobs_beyond_the_queue_limit_are_rejected_with_failed() {
+    let env = env().await;
+    let mut cloud = Cloud::connect(env.port).await;
+    let mut config = agent_config(env.port, env.state.path(), 30);
+    config.agent.shutdown_grace_secs = 1;
+    let agent = start_agent(config, 500, Duration::from_millis(400));
+    cloud.heartbeat_where(PrinterState::Idle).await;
+    let total = 60;
+    for n in 0..total {
+        cloud
+            .publish_job(&job(
+                &env.base,
+                &format!("job-q{n}"),
+                PRINTER,
+                &[("/land.jpg", ContentType::Jpeg, 1)],
+            ))
+            .await;
+    }
+    let mut rejected = Vec::new();
+    while rejected.len() < total - 1 - fotoko_pi_agent::agent::JOB_QUEUE - 2 {
+        let status = cloud.next_status().await;
+        if let Some(error) = &status.error
+            && error.message == "queue full"
+        {
+            assert_eq!(
+                (status.state, error.code),
+                (JobState::Failed, PiErrorCode::DriverError)
+            );
+            rejected.push(status.job_id.to_string());
+        }
+    }
+    assert!(
+        !rejected.contains(&"job-q0".to_owned()),
+        "the first job was accepted"
+    );
+    agent.stop().await.unwrap();
 }

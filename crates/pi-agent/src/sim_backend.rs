@@ -10,7 +10,7 @@ use fotoko_printer_sim::{Fault, SimConfig, SimError, SimPrinter};
 use fotoko_protocol::{Media, PrinterState};
 
 use crate::config::SimSection;
-use crate::printer::{PrintError, Printer};
+use crate::printer::{PrintContext, PrintError, Printer};
 
 /// Printer backed by the in-process simulation.
 #[derive(Debug)]
@@ -51,14 +51,40 @@ pub fn map_error(error: SimError) -> PrintError {
     }
 }
 
+/// Counts a page in progress, also when the print future is dropped.
+struct ActiveGuard<'a>(&'a AtomicU32);
+
+impl<'a> ActiveGuard<'a> {
+    fn new(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[async_trait]
 impl Printer for SimBackend {
-    async fn print(&self, file: &Path, copies: u32, _media: Media) -> Result<(), PrintError> {
+    async fn print(
+        &self,
+        file: &Path,
+        copies: u32,
+        _media: Media,
+        ctx: &PrintContext,
+    ) -> Result<(), PrintError> {
         let printer = Arc::clone(&self.printer);
         let file = file.to_owned();
-        self.active.fetch_add(1, Ordering::SeqCst);
-        let result = tokio::task::spawn_blocking(move || printer.print_file(&file, copies)).await;
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        let _active = ActiveGuard::new(&self.active);
+        let work = tokio::task::spawn_blocking(move || printer.print_file(&file, copies));
+        // A blocking page cannot be interrupted; it finishes in the background.
+        let result = tokio::select! {
+            () = ctx.cancel.cancelled() => return Err(PrintError::Cancelled),
+            result = work => result,
+        };
         match result {
             Ok(Ok(_pages)) => Ok(()),
             Ok(Err(error)) => Err(map_error(error)),
@@ -92,6 +118,10 @@ mod tests {
         path
     }
 
+    fn ctx() -> PrintContext {
+        PrintContext::new("t")
+    }
+
     fn backend(dir: &Path, paper: u32) -> (SimBackend, Arc<SimPrinter>) {
         let mut cfg = SimConfig::new(dir.join("out"));
         cfg.paper = paper;
@@ -104,7 +134,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (b, sim) = backend(dir.path(), 5);
         assert_eq!(b.state().await, PrinterState::Idle);
-        b.print(&image(dir.path()), 2, Media::Photo4x6)
+        b.print(&image(dir.path()), 2, Media::Photo4x6, &ctx())
             .await
             .unwrap();
         assert_eq!(sim.state().paper_remaining, 3);
@@ -138,12 +168,48 @@ mod tests {
         let file = image(dir.path());
         let running = {
             let b = Arc::clone(&b);
-            tokio::spawn(async move { b.print(&file, 1, Media::Photo4x6).await })
+            tokio::spawn(async move { b.print(&file, 1, Media::Photo4x6, &ctx()).await })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(b.state().await, PrinterState::Printing);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while b.state().await != PrinterState::Printing {
+            assert!(std::time::Instant::now() < deadline, "never printing");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         running.await.unwrap().unwrap();
         assert_eq!(b.state().await, PrinterState::Idle);
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_promptly_and_dropping_clears_the_printing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = SimConfig::new(dir.path().join("out"));
+        cfg.latency = Duration::from_secs(2);
+        let b = Arc::new(SimBackend::new(Arc::new(SimPrinter::new(cfg).unwrap())));
+        let file = image(dir.path());
+        let ctx = PrintContext::new("t");
+        let (b2, f2, c2) = (Arc::clone(&b), file.clone(), ctx.clone());
+        let task = tokio::spawn(async move { b2.print(&f2, 1, Media::Photo4x6, &c2).await });
+        while b.state().await != PrinterState::Printing {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ctx.cancel.cancel();
+        let started = std::time::Instant::now();
+        assert_eq!(task.await.unwrap(), Err(PrintError::Cancelled));
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(b.state().await, PrinterState::Idle);
+        // Dropping an in-flight print (task abort) also clears the state.
+        let (b3, f3) = (Arc::clone(&b), file);
+        let task = tokio::spawn(async move { b3.print(&f3, 1, Media::Photo4x6, &ctx_new()).await });
+        while b.state().await != PrinterState::Printing {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(b.state().await, PrinterState::Idle);
+    }
+
+    fn ctx_new() -> PrintContext {
+        PrintContext::new("t2")
     }
 
     #[tokio::test]
@@ -152,35 +218,35 @@ mod tests {
         let (b, sim) = backend(dir.path(), 1);
         let file = image(dir.path());
         assert_eq!(
-            b.print(&file, 2, Media::Photo4x6).await,
+            b.print(&file, 2, Media::Photo4x6, &ctx()).await,
             Err(PrintError::PaperOut)
         );
         sim.set_paper(5);
         sim.set_fault(Fault::Offline);
         assert!(matches!(
-            b.print(&file, 1, Media::Photo4x6).await,
+            b.print(&file, 1, Media::Photo4x6, &ctx()).await,
             Err(PrintError::Offline(_))
         ));
         sim.set_fault(Fault::RibbonOut);
         assert_eq!(
-            b.print(&file, 1, Media::Photo4x6).await,
+            b.print(&file, 1, Media::Photo4x6, &ctx()).await,
             Err(PrintError::RibbonOut)
         );
         sim.set_fault(Fault::DriverError);
         assert!(matches!(
-            b.print(&file, 1, Media::Photo4x6).await,
+            b.print(&file, 1, Media::Photo4x6, &ctx()).await,
             Err(PrintError::Driver(_))
         ));
         sim.set_fault(Fault::None);
         let bad = dir.path().join("bad.jpg");
         std::fs::write(&bad, b"nope").unwrap();
         assert!(matches!(
-            b.print(&bad, 1, Media::Photo4x6).await,
+            b.print(&bad, 1, Media::Photo4x6, &ctx()).await,
             Err(PrintError::InvalidImage(_))
         ));
         let missing = dir.path().join("missing.png");
         assert!(matches!(
-            b.print(&missing, 1, Media::Photo4x6).await,
+            b.print(&missing, 1, Media::Photo4x6, &ctx()).await,
             Err(PrintError::Driver(_))
         ));
     }
