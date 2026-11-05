@@ -10,7 +10,7 @@ describe.each([
   ['dev', dev],
   ['prod', prod],
 ] as const)('%s stack', (stage, template) => {
-  it('defines the single DynamoDB table with gsi1 and TTL', () => {
+  it('defines the single DynamoDB table with gsi1, gsi2 and TTL', () => {
     template.resourceCountIs('AWS::DynamoDB::Table', 1);
     template.hasResourceProperties('AWS::DynamoDB::Table', {
       TableName: `fotoko-${stage}`,
@@ -23,11 +23,21 @@ describe.each([
         { AttributeName: 'pk', AttributeType: 'S' },
         { AttributeName: 'sk', AttributeType: 'S' },
         { AttributeName: 'gsi1pk', AttributeType: 'S' },
+        { AttributeName: 'gsi2pk', AttributeType: 'S' },
+        { AttributeName: 'gsi2sk', AttributeType: 'S' },
       ]),
       GlobalSecondaryIndexes: [
         Match.objectLike({
           IndexName: 'gsi1',
           KeySchema: [{ AttributeName: 'gsi1pk', KeyType: 'HASH' }],
+          Projection: { ProjectionType: 'ALL' },
+        }),
+        Match.objectLike({
+          IndexName: 'gsi2',
+          KeySchema: [
+            { AttributeName: 'gsi2pk', KeyType: 'HASH' },
+            { AttributeName: 'gsi2sk', KeyType: 'RANGE' },
+          ],
           Projection: { ProjectionType: 'ALL' },
         }),
       ],
@@ -137,7 +147,7 @@ describe.each([
   });
 
   it('defines both Lambdas as arm64 provided.al2023 with a log group', () => {
-    for (const name of ['fotoko-http', 'fotoko-iot-status']) {
+    for (const name of ['fotoko-http', 'fotoko-iot-status', 'fotoko-expire']) {
       template.hasResourceProperties('AWS::Lambda::Function', {
         FunctionName: `fotoko-${stage}-${name}`,
         Runtime: 'provided.al2023',
@@ -170,6 +180,66 @@ describe.each([
     expect(fn.PAYOS_SECRET_ARN).toEqual({ Ref: secretId(template) });
     expect(JSON.stringify(fn.IOT_DATA_ENDPOINT)).toContain('endpointAddress');
     expect(JSON.stringify(fn.PUBLIC_APP_URL)).toContain('WebDistribution');
+  });
+
+  it.each([
+    ['fotoko-http', 29, 256],
+    ['fotoko-iot-status', 10, 128],
+    ['fotoko-expire', 60, 128],
+  ] as const)(
+    'sets %s timeout %is and memory %iMB',
+    (name, timeout, memory) => {
+      template.hasResourceProperties('AWS::Lambda::Function', {
+        FunctionName: `fotoko-${stage}-${name}`,
+        Timeout: timeout,
+        MemorySize: memory,
+      });
+    },
+  );
+
+  it('reserves concurrency 1 for fotoko-expire only', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      FunctionName: `fotoko-${stage}-fotoko-expire`,
+      ReservedConcurrentExecutions: 1,
+    });
+    const reserved = Object.values(
+      template.findResources('AWS::Lambda::Function'),
+    ).filter(
+      (f) =>
+        (f.Properties as { ReservedConcurrentExecutions?: number })
+          .ReservedConcurrentExecutions !== undefined,
+    );
+    expect(reserved).toHaveLength(1);
+  });
+
+  it('runs fotoko-expire every 5 minutes from an EventBridge rule', () => {
+    template.resourceCountIs('AWS::Events::Rule', 1);
+    template.hasResourceProperties('AWS::Events::Rule', {
+      Name: `fotoko-${stage}-expire`,
+      ScheduleExpression: 'rate(5 minutes)',
+      State: 'ENABLED',
+      Targets: [
+        Match.objectLike({
+          Arn: {
+            'Fn::GetAtt': [Match.stringLikeRegexp('^FunctionsExpire'), 'Arn'],
+          },
+        }),
+      ],
+    });
+    template.hasResourceProperties('AWS::Lambda::Permission', {
+      Action: 'lambda:InvokeFunction',
+      Principal: 'events.amazonaws.com',
+      FunctionName: {
+        'Fn::GetAtt': [Match.stringLikeRegexp('^FunctionsExpire'), 'Arn'],
+      },
+    });
+  });
+
+  it('gives fotoko-expire only the mode and the table', () => {
+    const fn = lambdaEnv(template, `fotoko-${stage}-fotoko-expire`);
+    expect(Object.keys(fn).sort()).toEqual(['FOTOKO_MODE', 'TABLE_NAME']);
+    expect(fn.FOTOKO_MODE).toBe('aws');
+    expect(fn.TABLE_NAME).toEqual({ Ref: tableId(template) });
   });
 
   it('gives fotoko-iot-status only the mode and the table', () => {
@@ -232,8 +302,8 @@ describe.each([
     expect(condition).toContain(':distribution/');
   });
 
-  it('gives every log group the stage retention (Lambdas, API, IoT rule, endpoint lookup)', () => {
-    template.resourceCountIs('AWS::Logs::LogGroup', 5);
+  it('gives every log group the stage retention (3 Lambdas, API, IoT rule, endpoint lookup)', () => {
+    template.resourceCountIs('AWS::Logs::LogGroup', 6);
     template.allResourcesProperties('AWS::Logs::LogGroup', {
       RetentionInDays: stage === 'prod' ? 90 : 7,
     });
@@ -319,13 +389,25 @@ describe.each([
   });
 
   it('alarms on Lambda errors and throttles, IoT rule failures and API 5xx into an unsubscribed SNS topic', () => {
-    template.resourceCountIs('AWS::CloudWatch::Alarm', 6);
+    template.resourceCountIs('AWS::CloudWatch::Alarm', 8);
     template.resourceCountIs('AWS::SNS::Topic', 1);
     template.resourceCountIs('AWS::SNS::Subscription', 0);
     template.hasResourceProperties('AWS::CloudWatch::Alarm', {
       MetricName: 'Errors',
       Namespace: 'AWS/Lambda',
     });
+    for (const metric of ['Errors', 'Throttles']) {
+      template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+        MetricName: metric,
+        Namespace: 'AWS/Lambda',
+        Dimensions: [
+          {
+            Name: 'FunctionName',
+            Value: { Ref: Match.stringLikeRegexp('^FunctionsExpire') },
+          },
+        ],
+      });
+    }
     template.hasResourceProperties('AWS::CloudWatch::Alarm', {
       MetricName: 'Throttles',
       Namespace: 'AWS/Lambda',
