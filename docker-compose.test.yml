@@ -1,0 +1,26 @@
+# Local dependencies of the `fotoko-api` integration tests (`FOTOKO_IT=1`).
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   FOTOKO_IT=1 cargo test -p fotoko-api --all-features -- --include-ignored
+#   docker compose -f docker-compose.test.yml down
+#
+# Ports are bound to loopback on uncommon host ports so they do not clash with a dev setup.
+# The tests read FOTOKO_IT_DYNAMODB_URL (default http://127.0.0.1:18000) and
+# FOTOKO_IT_S3_URL (default http://127.0.0.1:19000).
+services:
+  dynamodb:
+    # DynamoDB Local, in memory. Pinned by tag and digest.
+    image: amazon/dynamodb-local:3.1.0@sha256:7ef4a2c45b58c2901e70a4f28e0953a422c2c631baaaf5e2c15e0805740c7752
+    command: ['-jar', 'DynamoDBLocal.jar', '-inMemory', '-sharedDb']
+    ports:
+      - '127.0.0.1:18000:8000'
+
+  minio:
+    # S3 stand-in. The official minio/minio image is only published to quay.io; this Bitnami
+    # repack of MinIO RELEASE 2025-07-23 is on Docker Hub, which CI and sandboxes can reach.
+    image: bitnamilegacy/minio:2025.7.23@sha256:8935e75fa5d11295c17171e4aa49efe390a1193cd7f12e4d21b92af9ffef09d7
+    environment:
+      MINIO_ROOT_USER: fotoko
+      MINIO_ROOT_PASSWORD: fotoko-secret
+    ports:
+      - '127.0.0.1:19000:9000'
