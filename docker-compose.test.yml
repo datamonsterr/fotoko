@@ -1,7 +1,7 @@
 # Local dependencies of the `fotoko-api` integration tests (`FOTOKO_IT=1`).
 #
 #   docker compose -f docker-compose.test.yml up -d
-#   FOTOKO_IT=1 cargo test -p fotoko-api -- --include-ignored
+#   FOTOKO_IT=1 cargo test -p fotoko-api --all-features -- --include-ignored
 #   docker compose -f docker-compose.test.yml down
 #
 # Ports are bound to loopback on uncommon host ports so they do not clash with a dev setup.

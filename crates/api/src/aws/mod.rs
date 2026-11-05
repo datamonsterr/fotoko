@@ -168,14 +168,14 @@ impl ServiceRefresher for SecretRefresher {
         }
         let fresh =
             secrets::load_payos_credentials(&self.secrets, &self.config.payos_secret_arn).await?;
-        {
-            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-            if *current == fresh {
-                return Ok(None);
-            }
-            *current = fresh.clone();
+        if *self.current.lock().unwrap_or_else(PoisonError::into_inner) == fresh {
+            return Ok(None);
         }
-        http_service(&self.config, &self.sdk, fresh).map(Some)
+        // Remember the new credentials only once a service was built from them, so a failed
+        // build is retried at the next attempt instead of being mistaken for "unchanged".
+        let service = http_service(&self.config, &self.sdk, fresh.clone())?;
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
+        Ok(Some(service))
     }
 }
 
@@ -339,6 +339,16 @@ mod tests {
             // The new key is remembered: reading it again changes nothing.
             assert!(r.refresh().await.expect("refresh").is_none());
             assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
+
+        #[tokio::test]
+        async fn a_failed_build_is_not_remembered_as_current() {
+            // An empty checksum key cannot build a service.
+            let (r, calls, _server) = refresher(vec![" ", "new"], Duration::ZERO).await;
+            assert!(r.refresh().await.is_err());
+            // The next attempt sees a change again and succeeds.
+            assert!(r.refresh().await.expect("refresh").is_some());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
 
         #[tokio::test]
