@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/share/otherskill/bin/otherskill\" 'find' '--agent' 'claude' '--config' \"$CLAUDE_PROJECT_DIR/otherskill.config.json\"",
+            "timeout": 46
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/enforce-subagent-models.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
