@@ -1,9 +1,9 @@
 name: Deploy
 
 # A green CI run on a push to main deploys dev. Prod (and manual dev) deploys come from
-# workflow_dispatch.
-# Approvals live in the GitHub environments `dev` and `prod` (add required reviewers to prod).
-# Repository or environment variables: AWS_DEPLOY_ROLE_ARN (OIDC role to assume, per environment).
+# workflow_dispatch on main. Each deploy runs in four jobs so that dependency installs and
+# builds never see AWS credentials: build-lambdas, deploy-infra (credentials), build-web,
+# deploy-web (credentials). Setup: docs/ci.md (Deploy).
 on:
   workflow_run:
     workflows: [CI]
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: Stage to deploy
+        description: Stage to deploy (the run must be on main)
         type: choice
         options: [dev, prod]
         default: dev
@@ -29,42 +29,144 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   CARGO_NET_RETRY: '10'
+  STAGE: ${{ inputs.stage || 'dev' }}
+  AWS_REGION: ap-southeast-1
+  # The commit to deploy: the one CI tested, or the manually dispatched one.
+  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
-  deploy:
-    name: deploy (${{ inputs.stage || 'dev' }})
+  # Deploy only the current tip of main, from this repository, after a green push build.
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    # Only after CI succeeded for a push to main (ci-ok is the aggregate), or a manual run.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
-    environment: ${{ inputs.stage || 'dev' }}
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      STAGE: ${{ inputs.stage || 'dev' }}
-      AWS_REGION: ap-southeast-1
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          skip() { echo "::notice title=Deploy skipped::$1"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [ "$REF" = refs/heads/main ] || skip "manual deploys must run on main, got $REF"
+          else
+            [ "$CONCLUSION" = success ] || skip "CI concluded $CONCLUSION"
+            [ "$RUN_EVENT" = push ] || skip "CI ran for a $RUN_EVENT event, not a push"
+            [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] || skip "CI ran for $HEAD_REPO"
+          fi
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          [ "$tip" = "$DEPLOY_SHA" ] || skip "$DEPLOY_SHA is not the tip of main ($tip); a newer commit will deploy"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+
+  # No AWS credentials in this job.
+  build-lambdas:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ env.DEPLOY_SHA }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: lambda
-      - uses: ./.github/actions/setup-js
       - name: Install cargo-lambda
         run: pipx install cargo-lambda==1.9.2
+      - run: bash scripts/deploy/aws.sh build-lambdas
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lambdas
+          path: target/lambda
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy-infra:
+    needs: [gate, build-lambdas]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.stage || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      api_url: ${{ steps.deploy.outputs.api_url }}
+      pool_id: ${{ steps.deploy.outputs.pool_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lambdas
+          path: target/lambda
+      # Dependencies install before the credentials exist.
+      - uses: ./.github/actions/setup-js
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Deploy
-        run: bash scripts/deploy/aws.sh "$STAGE"
+      - id: deploy
+        run: bash scripts/deploy/aws.sh deploy-infra "$STAGE"
+
+  # No AWS credentials in this job; it only gets the public API URL and pool id.
+  build-web:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EXPO_PUBLIC_API_URL: ${{ needs.deploy-infra.outputs.api_url }}
+      EXPO_PUBLIC_COGNITO_IDENTITY_POOL_ID: ${{ needs.deploy-infra.outputs.pool_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-js
+      - run: bash scripts/deploy/aws.sh build-web "$STAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: apps/mobile/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy-web:
+    needs: [build-lambdas, build-web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.stage || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lambdas
+          path: target/lambda
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: apps/mobile/dist
+      - uses: ./.github/actions/setup-js
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: bash scripts/deploy/aws.sh deploy-web "$STAGE"
       - name: Summary
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
-        run: bash scripts/ci/summary.sh "deploy ${STAGE}" "bash scripts/deploy/aws.sh --dry-run ${STAGE}" "stack Fotoko-${STAGE} in ${AWS_REGION}"
+        run: bash scripts/ci/summary.sh "deploy ${STAGE}" "bash scripts/deploy/aws.sh --dry-run all ${STAGE}" "stack Fotoko-${STAGE} in ${AWS_REGION}, commit ${DEPLOY_SHA}"
