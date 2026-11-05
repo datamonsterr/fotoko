@@ -122,5 +122,10 @@ paper = 50                # sheets before paper_out
 fail = ""                 # "", "offline", "ribbon_out", "driver_error"
 [storage]
 state_dir = "/var/lib/fotoko"
-allow_insecure_http = false
+allow_insecure_http = false            # only valid with backend = "sim"
+allowed_hosts = [".amazonaws.com"]     # leading dot = subdomains; ignored in sim mode
 ```
+
+Optional keys (defaults): `mqtt.keep_alive_secs` (30), `mqtt.port` (8883 with TLS, 1883 without), `printer.cancel_bin` ("cancel"), `printer.print_timeout_secs` (300), `printer.poll_interval_ms` (1000), `sim.latency_ms` (0), `[agent] heartbeat_secs` (30), `download_timeout_secs` (60), `shutdown_grace_secs` (20).
+
+Pi behaviour notes: job ledger `jobs.jsonl` in `state_dir`; a jobId is refused while in progress or once finished, except after `download_failed` (cloud republishes `job-{orderId}`); unfinished jobs found at startup are reported `failed {driver_error}`; job queue bound 32 (overflow -> `failed {driver_error, "queue full"}`); images capped at 15 MiB and 50 MP; oversized/bad magic/undecodable -> `invalid_image`. Sim output files: `{jobId}-{idx}-{photoId}-{n}.png`.
