@@ -62,7 +62,7 @@ want=$(cut -d' ' -f1 "$SHA_FILE")
 remote_dir=$("${SSH[@]}" "$TARGET" 'mktemp -d /tmp/fotoko-deploy.XXXXXX')
 case $remote_dir in /tmp/fotoko-deploy.*) ;; *) die "unexpected remote temp dir: $remote_dir" ;; esac
 
-# shellcheck disable=SC2317 # called through the EXIT trap
+# shellcheck disable=SC2317,SC2329 # called through the EXIT trap
 cleanup() {
   # One ssh call: shred the private key, then remove the directory.
   if ! "${SSH[@]}" "$TARGET" "d='$remote_dir'; shred -u \"\$d/certs/private.pem.key\" 2>/dev/null || rm -f \"\$d/certs/private.pem.key\"; rm -rf \"\$d\""; then
