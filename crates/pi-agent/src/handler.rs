@@ -262,10 +262,10 @@ pub(crate) mod tests {
         async fn print(&self, file: &Path, copies: u32, _: Media) -> Result<(), PrintError> {
             let mut printed = self.printed.lock().unwrap();
             let call = printed.len();
-            if let Some((n, error)) = self.fail_on_call.lock().unwrap().clone() {
-                if n == call {
-                    return Err(error);
-                }
+            if let Some((n, error)) = self.fail_on_call.lock().unwrap().clone()
+                && n == call
+            {
+                return Err(error);
             }
             assert!(file.exists(), "file must exist while printing");
             printed.push((file.to_owned(), copies));
@@ -517,7 +517,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn invalid_jobs_fail_without_printing() {
         let mut f = fixture().await;
-        let cases: [(&str, Vec<(&str, ContentType, u32)>, &str); 4] = [
+        type Photos<'a> = Vec<(&'a str, ContentType, u32)>;
+        let cases: [(&str, Photos, &str); 4] = [
             ("empty", vec![], "no photos"),
             (
                 "many",

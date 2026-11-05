@@ -1,6 +1,7 @@
 //! Agent integration tests: real agent + embedded rumqttd broker + local HTTP image server +
 //! SimPrinter. The CUPS backend against the fake `lp`/`lpstat` lives in
 //! `crates/printer-sim/tests/cups.rs` (it needs those binaries built).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
