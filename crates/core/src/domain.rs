@@ -140,14 +140,15 @@ impl Printer {
         }
     }
 
-    /// `Validation` unless the printer is online.
-    pub fn require_online(&self) -> Result<(), CoreError> {
-        if self.status == PrinterStatus::Online {
+    /// `Validation` unless the printer takes orders: `online`, or `busy` (printing; further
+    /// jobs queue on the Pi).
+    pub fn require_bookable(&self) -> Result<(), CoreError> {
+        if matches!(self.status, PrinterStatus::Online | PrinterStatus::Busy) {
             Ok(())
         } else {
             Err(CoreError::Validation(format!(
-                "printer {} is not online",
-                self.printer_id
+                "printer {} takes no orders (status {:?})",
+                self.printer_id, self.status
             )))
         }
     }
@@ -386,13 +387,13 @@ mod tests {
         let info = printer(PrinterStatus::Online).to_info();
         assert_eq!(info.media, vec![Media::Photo4x6]);
         assert_eq!(info.price_per_print_vnd, 10_000);
-        assert_eq!(printer(PrinterStatus::Online).require_online(), Ok(()));
-        for status in [
-            PrinterStatus::Offline,
-            PrinterStatus::Busy,
-            PrinterStatus::Error,
-        ] {
-            let err = printer(status).require_online().expect_err("not online");
+        for status in [PrinterStatus::Online, PrinterStatus::Busy] {
+            assert_eq!(printer(status).require_bookable(), Ok(()));
+        }
+        for status in [PrinterStatus::Offline, PrinterStatus::Error] {
+            let err = printer(status)
+                .require_bookable()
+                .expect_err("not bookable");
             assert!(matches!(err, CoreError::Validation(_)));
         }
     }

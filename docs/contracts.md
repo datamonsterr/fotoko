@@ -36,7 +36,7 @@ Errors: `{"error":{"code":"<snake_case>","message":"..."}}`. Codes: `not_found`,
 | `POST /v1/orders/{orderId}/cancel`   | -                                                                                  | `200 Order`; only before `paid`                                                                                        |
 | `POST /v1/payments/payos/webhook`    | payOS webhook body                                                                 | `200 {"success":true}`; bad signature -> `400 validation`                                                              |
 
-Validation: 1..=10 photos, copies 1..=5 each, sizeBytes 1..=15 MiB, printer must be `online`. `amountVnd = sum(copies) * pricePerPrintVnd`. Order expires 15 min after creation unless paid. `uploads[i]` corresponds to request `photos[i]` (same order).
+Validation: 1..=10 photos, copies 1..=5 each, sizeBytes 1..=15 MiB, printer must be `online` or `busy` (printing; jobs queue on the Pi, bound 32), not `offline` or `error`. `amountVnd = sum(copies) * pricePerPrintVnd`. Order expires 15 min after creation unless paid. `uploads[i]` corresponds to request `photos[i]` (same order).
 
 Webhook handling (all return `200 {"success":true}` unless noted): paid -> order `paid` + job published; duplicate while `paid` -> job republished with the same `jobId` (Pi dedupes); duplicate after `printing` -> no-op; signed `data.code != "00"` -> no-op; payment for a `cancelled`/`expired` order -> no-op, logged at warn for manual refund (late payment); unknown `orderCode` -> no-op (payOS sends a sample on webhook URL confirmation); bad signature or missing `data.code` -> `400 validation`; amount mismatch -> `400 validation`, order unchanged.
 
