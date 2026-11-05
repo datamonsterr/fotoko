@@ -33,8 +33,19 @@ pub struct AppState {
     pub identity_mode: IdentityMode,
 }
 
-/// The HTTP API.
+/// The HTTP API with request ids and access logs.
 pub fn router(state: AppState) -> Router {
+    with_request_context(api_routes(state))
+}
+
+/// Request id header and access log span around every route of `router`.
+pub fn with_request_context(router: Router) -> Router {
+    router.layer(middleware::from_fn(request_context))
+}
+
+/// The routes of the HTTP API without the request-context layer, so that the local server can
+/// merge its own routes before layering.
+pub fn api_routes(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/printers/{printer_id}", get(get_printer))
@@ -46,7 +57,6 @@ pub fn router(state: AppState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(middleware::from_fn(request_context))
         .with_state(state)
 }
 
@@ -447,6 +457,38 @@ mod tests {
         )
         .await;
         assert_eq!((r.status, error_of(&r).0), (400, "validation"));
+    }
+
+    /// A request body whose stream breaks half way.
+    struct BrokenBody;
+
+    impl http_body::Body for BrokenBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(Some(Err(std::io::Error::other("connection reset"))))
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_body_is_400_validation() {
+        let h = harness();
+        let a = app(&h, IdentityMode::Local);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/orders")
+            .header("x-fotoko-identity", "me")
+            .body(Body::new(BrokenBody))
+            .expect("request");
+        let r = call(&a, request).await;
+        assert_eq!(
+            (r.status, error_of(&r)),
+            (400, ("validation", "unreadable request body"))
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,10 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod ids;
+pub mod local;
 pub mod payos;
+pub mod status;
+pub mod telemetry;
 
 pub use api::{AppState, router};
 pub use error::ApiError;
