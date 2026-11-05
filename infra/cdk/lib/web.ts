@@ -1,5 +1,10 @@
 import { existsSync } from 'node:fs';
-import { Duration, Validations } from 'aws-cdk-lib';
+import {
+  DefaultStackSynthesizer,
+  Duration,
+  Stack,
+  Validations,
+} from 'aws-cdk-lib';
 import {
   AllowedMethods,
   Distribution,
@@ -13,10 +18,14 @@ import {
   BlockPublicAccess,
   Bucket,
   BucketEncryption,
+  type CfnBucket,
 } from 'aws-cdk-lib/aws-s3';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
+import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
+import { LogGroup } from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
 import { WEB_DIST_DIR, type StageConfig } from './config';
+import { iam5Resource } from './nag';
 
 export interface WebProps {
   readonly config: StageConfig;
@@ -35,6 +44,7 @@ export class Web extends Construct {
   constructor(scope: Construct, id: string, props: WebProps) {
     super(scope, id);
     const { config } = props;
+    const stack = Stack.of(this);
 
     this.bucket = new Bucket(this, 'Bucket', {
       blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
@@ -59,6 +69,8 @@ export class Web extends Construct {
         responseHeadersPolicy: ResponseHeadersPolicy.SECURITY_HEADERS,
         compress: true,
       },
+      // SPA fallback: unknown paths return index.html so client-side routes (/orders/{id}) load.
+      // Trade-off: a real missing asset or an S3 error also shows index.html with 200, not a 404.
       // S3 answers 403 for missing keys when the caller lacks ListBucket.
       errorResponses: [
         { ...spaFallback, httpStatus: 403 },
@@ -76,12 +88,52 @@ export class Web extends Construct {
           `deployWeb is set but ${distDir} does not exist; run the Expo web export first.`,
         );
       }
+      // Own role and log group for the deployment handler: no managed policy, explicit retention.
+      const logGroup = new LogGroup(this, 'DeploymentLogs', {
+        retention: config.logRetention,
+        removalPolicy: config.removalPolicy,
+      });
+      const role = new Role(this, 'DeploymentRole', {
+        assumedBy: new ServicePrincipal('lambda.amazonaws.com'),
+      });
+      logGroup.grantWrite(role);
       new BucketDeployment(this, 'Deployment', {
         sources: [Source.asset(distDir)],
         destinationBucket: this.bucket,
         distribution: this.distribution,
         distributionPaths: ['/*'],
+        role,
+        logGroup,
       });
+      Validations.of(role).acknowledge(
+        ...[
+          'AwsSolutions-IAM5[Action::s3:GetObject*]',
+          'AwsSolutions-IAM5[Action::s3:GetBucket*]',
+          'AwsSolutions-IAM5[Action::s3:List*]',
+          'AwsSolutions-IAM5[Action::s3:DeleteObject*]',
+          'AwsSolutions-IAM5[Action::s3:Abort*]',
+          `AwsSolutions-IAM5[Resource::<${stack.getLogicalId(this.bucket.node.defaultChild as CfnBucket)}.Arn>/*]`,
+          iam5Resource(
+            stack,
+            `arn:${stack.partition}:s3:::cdk-${DefaultStackSynthesizer.DEFAULT_QUALIFIER}-assets-${stack.account}-${stack.region}/*`,
+          ),
+          'AwsSolutions-IAM5[Resource::*]',
+        ].map((id) => ({
+          id,
+          reason:
+            'BucketDeployment grants (CDK-generated) copy the export from the CDK asset bucket, prune the web bucket and invalidate CloudFront (invalidations have no resource-level permissions).',
+        })),
+      );
+      // The deployment handler is a stack-wide singleton owned by CDK; its runtime follows the CDK release.
+      for (const child of stack.node.findAll()) {
+        if (child.node.id.startsWith('Custom::CDKBucketDeployment')) {
+          Validations.of(child).acknowledge({
+            id: 'AwsSolutions-L1',
+            reason:
+              'Runtime of the CDK-managed BucketDeployment handler is set by aws-cdk-lib.',
+          });
+        }
+      }
     }
 
     Validations.of(this.bucket).acknowledge({

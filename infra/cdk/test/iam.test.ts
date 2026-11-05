@@ -46,7 +46,7 @@ describe('no broad IAM', () => {
     }
   });
 
-  it('uses no managed policies on our own roles', () => {
+  it('uses no managed policies on any role', () => {
     const roles = template.findResources('AWS::IAM::Role');
     const managed = Object.entries(roles)
       .filter(
@@ -55,33 +55,47 @@ describe('no broad IAM', () => {
             .ManagedPolicyArns !== undefined,
       )
       .map(([id]) => id);
-    // Only the CDK custom-resource provider role carries a managed policy.
-    expect(managed).toHaveLength(1);
-    expect(managed[0]).toMatch(/^AWS/);
+    expect(managed).toEqual([]);
   });
 });
 
 describe('Lambda roles', () => {
-  it('limits DynamoDB access to four item actions on the table and gsi1', () => {
-    const statements = byAction('dynamodb:GetItem');
-    expect(statements).toHaveLength(2); // fotoko-http and fotoko-iot-status
-    for (const { statement } of statements) {
-      expect(actionsOf(statement).sort()).toEqual([
-        'dynamodb:GetItem',
-        'dynamodb:PutItem',
-        'dynamodb:Query',
-        'dynamodb:UpdateItem',
-      ]);
-      const resources = json(statement.Resource);
-      expect(resources).toContain('DataTable');
-      expect(resources).toContain('/index/gsi1');
-      expect(asArray(statement.Resource as unknown[])).toHaveLength(2);
-    }
+  it('limits fotoko-http to four item actions on the table and gsi1', () => {
+    const statements = byAction('dynamodb:PutItem');
+    const { statement, roles } = one(statements);
+    expect(actionsOf(statement).sort()).toEqual([
+      'dynamodb:GetItem',
+      'dynamodb:PutItem',
+      'dynamodb:Query',
+      'dynamodb:UpdateItem',
+    ]);
+    const resources = asArray(statement.Resource as unknown[]);
+    expect(resources).toHaveLength(2);
+    expect(json(resources[0])).toContain('DataTable');
+    expect(json(resources[1])).toContain('/index/gsi1');
+    expect(json(roles)).toContain('HttpRole');
+  });
+
+  it('limits fotoko-iot-status to get, update and query on the table only', () => {
+    const { statement, roles } = one(
+      byAction('dynamodb:GetItem').filter(({ roles: r }) =>
+        json(r).includes('IotStatusRole'),
+      ),
+    );
+    expect(actionsOf(statement).sort()).toEqual([
+      'dynamodb:GetItem',
+      'dynamodb:Query',
+      'dynamodb:UpdateItem',
+    ]);
+    const resources = asArray(statement.Resource as unknown[]);
+    expect(resources).toHaveLength(1);
+    expect(json(resources[0])).toContain('DataTable');
+    expect(json(resources[0])).not.toContain('/index/');
+    expect(json(roles)).toContain('IotStatusRole');
   });
 
   it('gives only fotoko-http S3 object access, only under orders/', () => {
     const put = byAction('s3:PutObject');
-    expect(put).toHaveLength(1);
     const { statement, roles } = one(put);
     expect(actionsOf(statement).sort()).toEqual([
       's3:GetObject',
@@ -93,7 +107,17 @@ describe('Lambda roles', () => {
     expect(json(roles)).toContain('HttpRole');
     expect(byAction('s3:GetObject')).toHaveLength(1);
     expect(byAction('s3:DeleteObject')).toHaveLength(0);
-    expect(byAction('s3:ListBucket')).toHaveLength(0);
+  });
+
+  it('lists the photos bucket only for the orders/ prefix, so HeadObject on a missing key is a 404', () => {
+    const { statement, roles } = one(byAction('s3:ListBucket'));
+    expect(actionsOf(statement)).toEqual(['s3:ListBucket']);
+    expect(json(statement.Resource)).toContain('DataPhotosBucket');
+    expect(json(statement.Resource)).not.toContain('/*');
+    expect(statement.Condition).toEqual({
+      StringLike: { 's3:prefix': 'orders/*' },
+    });
+    expect(json(roles)).toContain('HttpRole');
   });
 
   it('allows iot:Publish only on printers jobs topics, only for fotoko-http', () => {
@@ -119,7 +143,8 @@ describe('Lambda roles', () => {
 
   it('writes logs only to its own log group', () => {
     const logs = byAction('logs:PutLogEvents');
-    expect(logs).toHaveLength(2);
+    // fotoko-http, fotoko-iot-status, IoT rule error logging, endpoint lookup provider.
+    expect(logs).toHaveLength(4);
     for (const { statement } of logs) {
       expect(actionsOf(statement).sort()).toEqual([
         'logs:CreateLogStream',

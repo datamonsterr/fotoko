@@ -19,7 +19,7 @@ import { Construct } from 'constructs';
 import { lambdaAssetPath, type StageConfig } from './config';
 import { GSI1, ORDERS_PREFIX } from './data';
 import { jobsTopicArnPattern } from './iot';
-import { findingId } from './nag';
+import { iam5Resource } from './nag';
 
 export interface FunctionsProps {
   readonly config: StageConfig;
@@ -31,9 +31,14 @@ export interface FunctionsProps {
   readonly publicAppUrl: string;
 }
 
-const TABLE_ACTIONS = [
+const HTTP_TABLE_ACTIONS = [
   'dynamodb:GetItem',
   'dynamodb:PutItem',
+  'dynamodb:UpdateItem',
+  'dynamodb:Query',
+];
+const STATUS_TABLE_ACTIONS = [
+  'dynamodb:GetItem',
   'dynamodb:UpdateItem',
   'dynamodb:Query',
 ];
@@ -48,15 +53,19 @@ export class Functions extends Construct {
     const { config, table, photosBucket } = props;
     const stack = Stack.of(this);
 
-    const environment = {
+    // fotoko-iot-status only touches the table; the rest belongs to fotoko-http.
+    const statusEnvironment = {
       FOTOKO_MODE: 'aws',
       TABLE_NAME: table.tableName,
+    };
+    const httpEnvironment = {
+      ...statusEnvironment,
       BUCKET_NAME: photosBucket.bucketName,
       IOT_DATA_ENDPOINT: props.iotDataEndpoint,
-      PAYOS_BASE_URL: 'https://api-merchant.payos.vn',
+      PAYOS_BASE_URL: config.payosBaseUrl,
       PAYOS_SECRET_ARN: props.payosSecret.secretArn,
       PUBLIC_APP_URL: props.publicAppUrl,
-      DEFAULT_PRICE_VND: '10000',
+      DEFAULT_PRICE_VND: String(config.defaultPriceVnd),
     };
 
     const make = (
@@ -64,6 +73,7 @@ export class Functions extends Construct {
       logicalId: string,
       memorySize: number,
       timeout: Duration,
+      environment: Record<string, string>,
     ) => {
       const logGroup = new LogGroup(this, `${logicalId}Logs`, {
         logGroupName: `/aws/lambda/fotoko-${config.stage}-${name}`,
@@ -90,26 +100,38 @@ export class Functions extends Construct {
       return { fn, role };
     };
 
-    const http = make('fotoko-http', 'Http', 256, Duration.seconds(15));
+    const http = make(
+      'fotoko-http',
+      'Http',
+      256,
+      Duration.seconds(15),
+      httpEnvironment,
+    );
     const status = make(
       'fotoko-iot-status',
       'IotStatus',
       128,
       Duration.seconds(10),
+      statusEnvironment,
     );
     this.http = http.fn;
     this.iotStatus = status.fn;
 
-    // DynamoDB: no Delete/Scan/Batch. Index access is limited to gsi1.
-    for (const { role } of [http, status]) {
-      role.addToPolicy(
-        new PolicyStatement({
-          effect: Effect.ALLOW,
-          actions: TABLE_ACTIONS,
-          resources: [table.tableArn, `${table.tableArn}/index/${GSI1}`],
-        }),
-      );
-    }
+    // DynamoDB: no Delete/Scan/Batch. Only fotoko-http reads gsi1 (webhook lookup by order code).
+    http.role.addToPolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        actions: HTTP_TABLE_ACTIONS,
+        resources: [table.tableArn, `${table.tableArn}/index/${GSI1}`],
+      }),
+    );
+    status.role.addToPolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        actions: STATUS_TABLE_ACTIONS,
+        resources: [table.tableArn],
+      }),
+    );
 
     // Presigned PUT/GET and HeadObject (authorised by s3:GetObject) on order photos only.
     http.role.addToPolicy(
@@ -119,17 +141,26 @@ export class Functions extends Construct {
         resources: [photosBucket.arnForObjects(`${ORDERS_PREFIX}*`)],
       }),
     );
+    // Without s3:ListBucket, HeadObject on a missing key answers 403 instead of 404.
+    http.role.addToPolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        actions: ['s3:ListBucket'],
+        resources: [photosBucket.bucketArn],
+        conditions: { StringLike: { 's3:prefix': `${ORDERS_PREFIX}*` } },
+      }),
+    );
     Validations.of(http.role).acknowledge(
       {
-        id: `AwsSolutions-IAM5[Resource::<${stack.getLogicalId(photosBucket.node.defaultChild as CfnBucket)}.Arn>/${ORDERS_PREFIX}*]`,
+        id: iam5Resource(
+          stack,
+          `<${stack.getLogicalId(photosBucket.node.defaultChild as CfnBucket)}.Arn>/${ORDERS_PREFIX}*`,
+        ),
         reason:
           'Photo object keys are dynamic (orders/{orderId}/{photoId}); access is limited to the orders/ prefix.',
       },
       {
-        id: findingId(
-          stack,
-          `AwsSolutions-IAM5[Resource::${jobsTopicArnPattern(stack)}]`,
-        ),
+        id: iam5Resource(stack, jobsTopicArnPattern(stack)),
         reason:
           'One jobs topic per printer; the printer id segment is dynamic and the topic suffix is fixed.',
       },

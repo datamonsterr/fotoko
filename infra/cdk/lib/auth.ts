@@ -1,8 +1,7 @@
-import { Duration, Validations } from 'aws-cdk-lib';
+import { Validations } from 'aws-cdk-lib';
 import {
   CfnIdentityPool,
   CfnIdentityPoolRoleAttachment,
-  UserPool,
 } from 'aws-cdk-lib/aws-cognito';
 import {
   Effect,
@@ -21,11 +20,10 @@ export interface AuthProps {
   readonly invokeArnFindings: readonly string[];
 }
 
-/** Guest identities (Cognito identity pool) and a placeholder operator user pool. */
+/** Guest identities: a Cognito identity pool whose unauthenticated role may only call the order routes. */
 export class Auth extends Construct {
   readonly identityPool: CfnIdentityPool;
   readonly guestRole: Role;
-  readonly userPool: UserPool;
 
   constructor(scope: Construct, id: string, props: AuthProps) {
     super(scope, id);
@@ -76,42 +74,5 @@ export class Auth extends Construct {
       identityPoolId: this.identityPool.ref,
       roles: { unauthenticated: this.guestRole.roleArn },
     });
-
-    // Future use: operator sign-in. Nothing references it yet.
-    this.userPool = new UserPool(this, 'OperatorUserPool', {
-      userPoolName: `fotoko-${config.stage}-operators`,
-      selfSignUpEnabled: false,
-      signInAliases: { email: true },
-      passwordPolicy: {
-        minLength: 12,
-        requireLowercase: true,
-        requireUppercase: true,
-        requireDigits: true,
-        requireSymbols: true,
-        tempPasswordValidity: Duration.days(3),
-      },
-      removalPolicy: config.removalPolicy,
-    });
-    this.userPool.addClient('OperatorAppClient', {
-      generateSecret: false,
-      authFlows: { userSrp: true },
-    });
-    Validations.of(this.userPool).acknowledge(
-      {
-        id: 'AwsSolutions-COG2',
-        reason:
-          'Placeholder pool for future operator sign-in; no users exist yet. Enable MFA before use.',
-      },
-      {
-        id: 'AwsSolutions-COG8',
-        reason:
-          'Placeholder pool for future operator sign-in; the plus feature plan is chosen before use.',
-      },
-      {
-        id: 'AwsSolutions-COG3',
-        reason:
-          'Placeholder pool for future operator sign-in; advanced security (paid) is enabled before use.',
-      },
-    );
   }
 }

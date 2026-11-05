@@ -1,6 +1,7 @@
-import { Match, Template } from 'aws-cdk-lib/assertions';
+import { join } from 'node:path';
+import { Match } from 'aws-cdk-lib/assertions';
 import { describe, expect, it } from 'vitest';
-import { build } from './helpers';
+import { bucketId, build, lambdaEnv, secretId, tableId } from './helpers';
 
 const dev = build('dev').template;
 const prod = build('prod').template;
@@ -131,43 +132,108 @@ describe.each([
     });
   });
 
-  it('keeps the operator user pool minimal: one client, no self sign-up', () => {
-    template.resourceCountIs('AWS::Cognito::UserPool', 1);
-    template.resourceCountIs('AWS::Cognito::UserPoolClient', 1);
-    template.hasResourceProperties('AWS::Cognito::UserPool', {
-      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true },
-    });
-    template.hasResourceProperties('AWS::Cognito::UserPoolClient', {
-      GenerateSecret: false,
-    });
+  it('has no Cognito user pool yet (operators are future work)', () => {
+    template.resourceCountIs('AWS::Cognito::UserPool', 0);
   });
 
-  it('defines both Lambdas as arm64 provided.al2023 with the contract env vars', () => {
+  it('defines both Lambdas as arm64 provided.al2023 with a log group', () => {
     for (const name of ['fotoko-http', 'fotoko-iot-status']) {
       template.hasResourceProperties('AWS::Lambda::Function', {
         FunctionName: `fotoko-${stage}-${name}`,
         Runtime: 'provided.al2023',
         Architectures: ['arm64'],
         Handler: 'bootstrap',
-        Environment: {
-          Variables: Match.objectLike({
-            FOTOKO_MODE: 'aws',
-            TABLE_NAME: Match.anyValue(),
-            BUCKET_NAME: Match.anyValue(),
-            IOT_DATA_ENDPOINT: Match.anyValue(),
-            PAYOS_BASE_URL: 'https://api-merchant.payos.vn',
-            PAYOS_SECRET_ARN: Match.anyValue(),
-            PUBLIC_APP_URL: Match.anyValue(),
-            DEFAULT_PRICE_VND: '10000',
-          }),
-        },
         LoggingConfig: { LogGroup: Match.anyValue() },
       });
     }
   });
 
-  it('retains log groups per stage retention', () => {
-    template.resourceCountIs('AWS::Logs::LogGroup', 3);
+  it('gives fotoko-http the full contract env, wired to the right resources', () => {
+    const fn = lambdaEnv(template, `fotoko-${stage}-fotoko-http`);
+    expect(Object.keys(fn).sort()).toEqual([
+      'BUCKET_NAME',
+      'DEFAULT_PRICE_VND',
+      'FOTOKO_MODE',
+      'IOT_DATA_ENDPOINT',
+      'PAYOS_BASE_URL',
+      'PAYOS_SECRET_ARN',
+      'PUBLIC_APP_URL',
+      'TABLE_NAME',
+    ]);
+    expect(fn.FOTOKO_MODE).toBe('aws');
+    expect(fn.PAYOS_BASE_URL).toBe('https://api-merchant.payos.vn');
+    expect(fn.DEFAULT_PRICE_VND).toBe('10000');
+    expect(fn.TABLE_NAME).toEqual({ Ref: tableId(template) });
+    expect(fn.BUCKET_NAME).toEqual({
+      Ref: bucketId(template, 'DataPhotosBucket'),
+    });
+    expect(fn.PAYOS_SECRET_ARN).toEqual({ Ref: secretId(template) });
+    expect(JSON.stringify(fn.IOT_DATA_ENDPOINT)).toContain('endpointAddress');
+    expect(JSON.stringify(fn.PUBLIC_APP_URL)).toContain('WebDistribution');
+  });
+
+  it('gives fotoko-iot-status only the mode and the table', () => {
+    const fn = lambdaEnv(template, `fotoko-${stage}-fotoko-iot-status`);
+    expect(Object.keys(fn).sort()).toEqual(['FOTOKO_MODE', 'TABLE_NAME']);
+    expect(fn.TABLE_NAME).toEqual({ Ref: tableId(template) });
+  });
+
+  it('allows exactly the app origins in CORS on the API and the photos bucket', () => {
+    const origins = (value: unknown): string[] =>
+      (Array.isArray(value) ? (value as unknown[]) : []).map((o) =>
+        JSON.stringify(o),
+      );
+    const expected = stage === 'prod' ? 1 : 2;
+    const api = Object.values(
+      template.findResources('AWS::ApiGatewayV2::Api'),
+    )[0];
+    const apiOrigins = (
+      api?.Properties as { CorsConfiguration: { AllowOrigins: unknown[] } }
+    ).CorsConfiguration.AllowOrigins;
+    expect(apiOrigins).toHaveLength(expected);
+    expect(JSON.stringify(apiOrigins[0])).toContain('WebDistribution');
+    if (stage === 'dev') expect(apiOrigins[1]).toBe('http://localhost:8081');
+
+    const bucket = Object.entries(
+      template.findResources('AWS::S3::Bucket'),
+    ).find(([id]) => id.startsWith('DataPhotosBucket'));
+    const rules = (
+      bucket?.[1].Properties as {
+        CorsConfiguration: {
+          CorsRules: { AllowedOrigins: unknown[]; AllowedHeaders: string[] }[];
+        };
+      }
+    ).CorsConfiguration.CorsRules;
+    expect(rules).toHaveLength(1);
+    expect(rules[0]?.AllowedOrigins).toEqual(apiOrigins);
+    expect(rules[0]?.AllowedHeaders).toEqual(['content-type', 'x-amz-*']);
+    expect(origins(apiOrigins).join()).not.toContain('"*"');
+    expect(JSON.stringify(template.toJSON())).not.toMatch(
+      /"AllowOrigins":\["\*"\]|"AllowedOrigins":\["\*"\]/,
+    );
+  });
+
+  it('lets only this CloudFront distribution read the web bucket', () => {
+    const policy = Object.entries(
+      template.findResources('AWS::S3::BucketPolicy'),
+    ).find(([id]) => id.startsWith('WebBucket'))?.[1];
+    const statements = (
+      policy?.Properties as {
+        PolicyDocument: { Statement: Record<string, unknown>[] };
+      }
+    ).PolicyDocument.Statement;
+    const read = statements.find((st) => st.Action === 's3:GetObject');
+    expect(read?.Effect).toBe('Allow');
+    expect(read?.Principal).toEqual({ Service: 'cloudfront.amazonaws.com' });
+    expect(Object.keys(read?.Condition ?? {})).toEqual(['StringEquals']);
+    const condition = JSON.stringify(read?.Condition);
+    expect(condition).toContain('AWS:SourceArn');
+    expect(condition).toContain('WebDistribution');
+    expect(condition).toContain(':distribution/');
+  });
+
+  it('gives every log group the stage retention (Lambdas, API, IoT rule, endpoint lookup)', () => {
+    template.resourceCountIs('AWS::Logs::LogGroup', 5);
     template.allResourcesProperties('AWS::Logs::LogGroup', {
       RetentionInDays: stage === 'prod' ? 90 : 7,
     });
@@ -183,6 +249,12 @@ describe.each([
   it('routes only status and heartbeat topics to the iot-status Lambda', () => {
     template.hasResourceProperties('AWS::IoT::TopicRule', {
       TopicRulePayload: {
+        ErrorAction: {
+          CloudwatchLogs: {
+            LogGroupName: Match.anyValue(),
+            RoleArn: Match.anyValue(),
+          },
+        },
         Sql:
           "SELECT *, topic(3) AS printerId FROM 'fotoko/printers/+/+' " +
           "WHERE topic(4) = 'status' OR topic(4) = 'heartbeat'",
@@ -246,13 +318,24 @@ describe.each([
     });
   });
 
-  it('alarms on Lambda errors and API 5xx into an SNS topic without subscriptions', () => {
-    template.resourceCountIs('AWS::CloudWatch::Alarm', 3);
+  it('alarms on Lambda errors and throttles, IoT rule failures and API 5xx into an unsubscribed SNS topic', () => {
+    template.resourceCountIs('AWS::CloudWatch::Alarm', 6);
     template.resourceCountIs('AWS::SNS::Topic', 1);
     template.resourceCountIs('AWS::SNS::Subscription', 0);
     template.hasResourceProperties('AWS::CloudWatch::Alarm', {
       MetricName: 'Errors',
       Namespace: 'AWS/Lambda',
+    });
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      MetricName: 'Throttles',
+      Namespace: 'AWS/Lambda',
+    });
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      MetricName: 'Failure',
+      Namespace: 'AWS/IoT',
+      Dimensions: [
+        { Name: 'RuleName', Value: `fotoko_${stage}_printer_status` },
+      ],
     });
     template.hasResourceProperties('AWS::CloudWatch::Alarm', {
       MetricName: '5xx',
@@ -277,6 +360,58 @@ describe.each([
         'WebUrl',
       ].sort(),
     );
+  });
+});
+
+describe('API route throttling', () => {
+  it.each([
+    ['dev', 5, 10, 5, 10],
+    ['prod', 25, 50, 20, 40],
+  ] as const)(
+    '%s: webhook and order routes have their own budgets',
+    (stage, wRate, wBurst, oRate, oBurst) => {
+      const { template: t } = build(stage);
+      const stageResource = Object.values(
+        t.findResources('AWS::ApiGatewayV2::Stage'),
+      )[0];
+      const settings = (
+        stageResource?.Properties as {
+          RouteSettings: Record<string, Record<string, number>>;
+        }
+      ).RouteSettings;
+      expect(Object.keys(settings).sort()).toEqual(
+        [
+          'GET /v1/orders/{orderId}',
+          'POST /v1/orders',
+          'POST /v1/orders/{orderId}/cancel',
+          'POST /v1/orders/{orderId}/checkout',
+          'POST /v1/payments/payos/webhook',
+        ].sort(),
+      );
+      expect(settings['POST /v1/payments/payos/webhook']).toEqual({
+        ThrottlingRateLimit: wRate,
+        ThrottlingBurstLimit: wBurst,
+      });
+      for (const key of Object.keys(settings).filter(
+        (k) => !k.includes('webhook'),
+      )) {
+        expect(settings[key]).toEqual({
+          ThrottlingRateLimit: oRate,
+          ThrottlingBurstLimit: oBurst,
+        });
+      }
+    },
+  );
+});
+
+describe('alarm subscription', () => {
+  it('subscribes the alarmEmail to the topic', () => {
+    const { template: t } = build('prod', { alarmEmail: 'ops@example.com' });
+    t.resourceCountIs('AWS::SNS::Subscription', 1);
+    t.hasResourceProperties('AWS::SNS::Subscription', {
+      Protocol: 'email',
+      Endpoint: 'ops@example.com',
+    });
   });
 });
 
@@ -347,6 +482,21 @@ describe('prod versus dev', () => {
 });
 
 describe('web deployment flag', () => {
+  it('uploads the export with own role, log group and no nag findings', () => {
+    const { app, template: t } = build(
+      'dev',
+      {
+        deployWeb: true,
+        webDistDir: join(import.meta.dirname, 'fixtures', 'web-dist'),
+      },
+      true,
+    );
+    expect(() => app.synth()).not.toThrow();
+    expect(
+      Object.keys(t.findResources('Custom::CDKBucketDeployment')),
+    ).toHaveLength(1);
+  });
+
   it('adds no BucketDeployment by default', () => {
     expect(
       Object.keys(dev.findResources('Custom::CDKBucketDeployment')),
@@ -366,8 +516,4 @@ describe('Lambda code location', () => {
       /cargo lambda build/,
     );
   });
-});
-
-it('produces a Template instance', () => {
-  expect(dev).toBeInstanceOf(Template);
 });

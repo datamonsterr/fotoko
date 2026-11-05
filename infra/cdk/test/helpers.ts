@@ -46,3 +46,40 @@ export function policyStatements(
 
 export const asArray = <T>(value: T | T[]): T[] =>
   Array.isArray(value) ? value : [value];
+
+type Resources = Record<string, { Properties: Record<string, unknown> }>;
+
+/** Environment variables of the Lambda with this function name. */
+export function lambdaEnv(
+  template: Template,
+  functionName: string,
+): Record<string, unknown> {
+  const fns = template.findResources('AWS::Lambda::Function') as Resources;
+  const fn = Object.values(fns).find(
+    (f) => f.Properties.FunctionName === functionName,
+  );
+  if (!fn) throw new Error(`No Lambda ${functionName}`);
+  return (fn.Properties.Environment as { Variables: Record<string, unknown> })
+    .Variables;
+}
+
+const idStartingWith = (
+  template: Template,
+  type: string,
+  prefix: string,
+): string => {
+  const ids = Object.keys(template.findResources(type)).filter((id) =>
+    id.startsWith(prefix),
+  );
+  const [id] = ids;
+  if (ids.length !== 1 || id === undefined)
+    throw new Error(`Expected one ${type} starting with ${prefix}`);
+  return id;
+};
+
+export const tableId = (template: Template): string =>
+  idStartingWith(template, 'AWS::DynamoDB::Table', 'DataTable');
+export const secretId = (template: Template): string =>
+  idStartingWith(template, 'AWS::SecretsManager::Secret', 'DataPayosSecret');
+export const bucketId = (template: Template, prefix: string): string =>
+  idStartingWith(template, 'AWS::S3::Bucket', prefix);

@@ -10,16 +10,27 @@ export type Stage = (typeof STAGES)[number];
 /** Repository root (this file is `infra/cdk/lib/config.ts`). */
 const REPO_ROOT = resolve(import.meta.dirname, '../../..');
 
+export interface Throttle {
+  readonly rateLimit: number;
+  readonly burstLimit: number;
+}
+
 export interface StageConfig {
   readonly stage: Stage;
   readonly isProd: boolean;
   readonly removalPolicy: RemovalPolicy;
   readonly logRetention: RetentionDays;
   readonly pointInTimeRecovery: boolean;
-  readonly throttle: {
-    readonly rateLimit: number;
-    readonly burstLimit: number;
-  };
+  /** Stage-wide default throttle of the HTTP API. */
+  readonly throttle: Throttle;
+  /** Own budget of the payOS webhook route (provider retries must not starve customers). */
+  readonly webhookThrottle: Throttle;
+  /** Lower budget of each customer order route. */
+  readonly orderThrottle: Throttle;
+  readonly payosBaseUrl: string;
+  readonly defaultPriceVnd: number;
+  /** Subscribed to the alarm topic when set. */
+  readonly alarmEmail?: string;
   /** Extra browser origins allowed by CORS (API and photos bucket), besides the web distribution. */
   readonly extraOrigins: readonly string[];
 }
@@ -43,9 +54,38 @@ export function parseStage(value: string | undefined): Stage {
   return stage as Stage;
 }
 
+/**
+ * Validate browser origins: `https://host[:port]`, or `http://localhost|127.0.0.1[:port]` for local
+ * development. No wildcards, paths, queries or trailing slashes.
+ */
+export function parseOrigins(origins: readonly string[]): string[] {
+  return origins.map((origin) => {
+    let url: URL;
+    try {
+      url = new URL(origin);
+    } catch {
+      throw new Error(`Invalid origin "${origin}": not a URL`);
+    }
+    const local = ['localhost', '127.0.0.1'].includes(url.hostname);
+    const schemeOk =
+      url.protocol === 'https:' || (url.protocol === 'http:' && local);
+    if (origin.includes('*') || !schemeOk || url.origin !== origin) {
+      throw new Error(
+        `Invalid origin "${origin}": use https://host[:port] (http only for localhost), no wildcard, path or trailing slash`,
+      );
+    }
+    return origin;
+  });
+}
+
+export interface StageOverrides {
+  readonly extraOrigins?: readonly string[];
+  readonly alarmEmail?: string;
+}
+
 export function stageConfig(
   stage: Stage,
-  extraOrigins: readonly string[] = [],
+  overrides: StageOverrides = {},
 ): StageConfig {
   const isProd = stage === 'prod';
   return {
@@ -57,9 +97,18 @@ export function stageConfig(
     throttle: isProd
       ? { rateLimit: 50, burstLimit: 100 }
       : { rateLimit: 10, burstLimit: 20 },
+    webhookThrottle: isProd
+      ? { rateLimit: 25, burstLimit: 50 }
+      : { rateLimit: 5, burstLimit: 10 },
+    orderThrottle: isProd
+      ? { rateLimit: 20, burstLimit: 40 }
+      : { rateLimit: 5, burstLimit: 10 },
+    payosBaseUrl: 'https://api-merchant.payos.vn',
+    defaultPriceVnd: 10000,
+    ...(overrides.alarmEmail ? { alarmEmail: overrides.alarmEmail } : {}),
     extraOrigins: [
       ...(isProd ? [] : ['http://localhost:8081']),
-      ...extraOrigins,
+      ...parseOrigins(overrides.extraOrigins ?? []),
     ],
   };
 }
