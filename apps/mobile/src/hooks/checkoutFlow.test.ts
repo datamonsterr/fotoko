@@ -722,4 +722,18 @@ describe('CheckoutFlow abandoned orders', () => {
     await settle();
     expect(cancelOrder).toHaveBeenCalledWith('ord-2');
   });
+
+  it('a throwing client while abandoning is swallowed', async () => {
+    const { flow, settle } = setup(1, { upload: () => new Promise(() => {}) });
+    flow.start();
+    await settle();
+    flow.setDeps({
+      client: () => {
+        throw new Error('no client');
+      },
+      onCheckout: jest.fn(),
+    });
+    flow.dispose();
+    await expect(settle()).resolves.toBeUndefined();
+  });
 });
