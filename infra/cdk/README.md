@@ -41,7 +41,7 @@ pnpm --filter @fotoko/infra provision-printer --printer-id stand-001 --stage dev
 Creates the IoT thing and certificate, attaches the device policy, and writes `device.pem.crt`, `private.pem.key` (0600), `AmazonRootCA1.pem` and `agent.toml`. Needs AWS credentials. Copy the files to `/etc/fotoko/` on the Pi.
 
 - The endpoint and root CA are fetched before anything is created. If a later step fails, the certificate, attachments and a thing created in this run are rolled back; rollback failures are listed in the error.
-- An existing thing is refused unless `--rotate`: the new certificate is attached first, then the old ones are detached, deactivated and deleted. Existing files in the output directory are refused unless `--force`.
+- An existing thing is refused unless `--rotate`: the new certificate is attached first, then the old ones are detached, deactivated and deleted. Rotation retires the old certificate immediately, so the Pi goes offline until the new files are installed: back up the current files first and copy the new ones to the Pi promptly. Existing files in the output directory are refused unless `--force`.
 
 ### After the first deploy
 

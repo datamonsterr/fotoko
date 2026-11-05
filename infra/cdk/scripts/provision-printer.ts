@@ -208,15 +208,19 @@ export async function provisionPrinter(
   if (!thingExists && rotate) {
     throw new Error(`Thing "${printerId}" does not exist; nothing to rotate.`);
   }
-  const oldCertificates = thingExists
-    ? (
-        (
-          await client.send(
-            new ListThingPrincipalsCommand({ thingName: printerId }),
-          )
-        ).principals ?? []
-      ).filter((principal) => principal.includes(':cert/'))
-    : [];
+  const oldCertificates: string[] = [];
+  if (thingExists) {
+    let nextToken: string | undefined;
+    do {
+      const page = await client.send(
+        new ListThingPrincipalsCommand({ thingName: printerId, nextToken }),
+      );
+      oldCertificates.push(
+        ...(page.principals ?? []).filter((p) => p.includes(':cert/')),
+      );
+      nextToken = page.nextToken;
+    } while (nextToken);
+  }
 
   // Everything that can fail without side effects goes first.
   const endpoint = await client.send(
@@ -269,20 +273,22 @@ export async function provisionPrinter(
     log(`attached policy ${policyName} and thing principal`);
 
     await mkdir(outDir, { recursive: true });
-    const flag = force ? 'w' : 'wx';
-    await writeFile(paths.key, keyPair.PrivateKey, { mode: 0o600, flag });
-    written.push(paths.key);
+    // Paths are tracked before writing so a partial write is cleaned up. Always create with
+    // 'wx' after removing any file that --force replaces, so the key is never world-readable.
+    const write = async (path: string, data: string, mode: number) => {
+      written.push(path);
+      if (force) await rm(path, { force: true });
+      await writeFile(path, data, { mode, flag: 'wx' });
+    };
+    await write(paths.key, keyPair.PrivateKey, 0o600);
     await chmod(paths.key, 0o600);
-    await writeFile(paths.cert, certificatePem, { mode: 0o644, flag });
-    written.push(paths.cert);
-    await writeFile(paths.ca, ca, { mode: 0o644, flag });
-    written.push(paths.ca);
-    await writeFile(
+    await write(paths.cert, certificatePem, 0o644);
+    await write(paths.ca, ca, 0o644);
+    await write(
       paths.toml,
       renderAgentToml(printerId, endpoint.endpointAddress),
-      { mode: 0o644, flag },
+      0o644,
     );
-    written.push(paths.toml);
     log(`wrote device files to ${outDir}`);
   } catch (error) {
     const arn = certificateArn;
@@ -358,7 +364,8 @@ export async function provisionPrinter(
     );
   }
 
-  // Rotation: the new certificate is live, retire the old ones.
+  // Rotation: the new certificate is live, retire the old ones. This is immediate: the Pi
+  // running on the old certificate loses its connection until the new files are installed.
   const rotationWarnings: string[] = [];
   for (const old of oldCertificates) {
     const failures = await runAll([

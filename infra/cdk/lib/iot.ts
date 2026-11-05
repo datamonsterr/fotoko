@@ -35,6 +35,9 @@ export class IotEndpoint extends Construct {
 
   constructor(scope: Construct, id: string, props: IotEndpointProps) {
     super(scope, id);
+    // Own role and log group for the provider function. AwsCustomResource shares one singleton
+    // function per stack, so this role (and its policy) is shared by every AwsCustomResource
+    // added to the stack later; give those their own statements via `policy`, not a new role.
     // Own role and log group for the (stack-wide singleton) provider function: no managed policy,
     // explicit retention and removal policy.
     const logGroup = new LogGroup(this, 'ProviderLogs', {

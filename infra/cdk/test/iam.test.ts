@@ -109,14 +109,12 @@ describe('Lambda roles', () => {
     expect(byAction('s3:DeleteObject')).toHaveLength(0);
   });
 
-  it('lists the photos bucket only for the orders/ prefix, so HeadObject on a missing key is a 404', () => {
+  it('lists the photos bucket (no condition: s3:prefix does not apply to HeadObject) so a missing key is a 404', () => {
     const { statement, roles } = one(byAction('s3:ListBucket'));
     expect(actionsOf(statement)).toEqual(['s3:ListBucket']);
     expect(json(statement.Resource)).toContain('DataPhotosBucket');
     expect(json(statement.Resource)).not.toContain('/*');
-    expect(statement.Condition).toEqual({
-      StringLike: { 's3:prefix': 'orders/*' },
-    });
+    expect(statement.Condition).toBeUndefined();
     expect(json(roles)).toContain('HttpRole');
   });
 
