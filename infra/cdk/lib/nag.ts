@@ -7,18 +7,19 @@ export function applyNag(app: App): void {
 }
 
 /**
- * Render an ARN-bearing cdk-nag finding id the way cdk-nag prints it: the stack's partition and
- * account tokens become `<AWS::Partition>` / `<AWS::AccountId>`, or stay literal when the
- * `enablePartitionLiterals` flag is on.
+ * cdk-nag id of an `AwsSolutions-IAM5` wildcard finding on `resource`, an ARN built from this
+ * stack's `partition` and `account` (or a `<LogicalId.Arn>/...` GetAtt rendering). cdk-nag prints
+ * unresolved partition and account tokens as `<AWS::Partition>` and `<AWS::AccountId>`.
  */
-export function findingId(stack: Stack, id: string): string {
+export function iam5Resource(stack: Stack, resource: string): string {
   const partition = Token.isUnresolved(stack.partition)
     ? '<AWS::Partition>'
     : stack.partition;
   const account = Token.isUnresolved(stack.account)
     ? '<AWS::AccountId>'
     : stack.account;
-  return id
-    .replaceAll(stack.partition, partition)
+  const rendered = resource
+    .replace(`arn:${stack.partition}:`, `arn:${partition}:`)
     .replaceAll(stack.account, account);
+  return `AwsSolutions-IAM5[Resource::${rendered}]`;
 }

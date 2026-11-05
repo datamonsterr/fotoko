@@ -1,8 +1,14 @@
 import { Stack, Validations } from 'aws-cdk-lib';
-import { Effect, PolicyDocument, PolicyStatement } from 'aws-cdk-lib/aws-iam';
+import {
+  Effect,
+  PolicyDocument,
+  PolicyStatement,
+  Role,
+  ServicePrincipal,
+} from 'aws-cdk-lib/aws-iam';
 import { CfnPolicy, CfnThingType, CfnTopicRule } from 'aws-cdk-lib/aws-iot';
 import type { IFunction } from 'aws-cdk-lib/aws-lambda';
-import { ServicePrincipal } from 'aws-cdk-lib/aws-iam';
+import { LogGroup } from 'aws-cdk-lib/aws-logs';
 import {
   AwsCustomResource,
   AwsCustomResourcePolicy,
@@ -19,14 +25,30 @@ export function jobsTopicArnPattern(stack: Stack): string {
   return `arn:${stack.partition}:iot:${stack.region}:${stack.account}:topic/${TOPIC_ROOT}/*/jobs`;
 }
 
+export interface IotEndpointProps {
+  readonly config: StageConfig;
+}
+
 /** The account's ATS data endpoint (`xxxx-ats.iot.<region>.amazonaws.com`), via `DescribeEndpoint`. */
 export class IotEndpoint extends Construct {
   readonly address: string;
 
-  constructor(scope: Construct, id: string) {
+  constructor(scope: Construct, id: string, props: IotEndpointProps) {
     super(scope, id);
+    // Own role and log group for the (stack-wide singleton) provider function: no managed policy,
+    // explicit retention and removal policy.
+    const logGroup = new LogGroup(this, 'ProviderLogs', {
+      retention: props.config.logRetention,
+      removalPolicy: props.config.removalPolicy,
+    });
+    const role = new Role(this, 'ProviderRole', {
+      assumedBy: new ServicePrincipal('lambda.amazonaws.com'),
+    });
+    logGroup.grantWrite(role);
     const lookup = new AwsCustomResource(this, 'DescribeEndpoint', {
       installLatestAwsSdk: false,
+      role,
+      logGroup,
       onUpdate: {
         service: 'Iot',
         action: 'describeEndpoint',
@@ -47,15 +69,6 @@ export class IotEndpoint extends Construct {
       reason:
         'iot:DescribeEndpoint does not support resource-level permissions.',
     });
-    // The singleton provider function shared by every AwsCustomResource in the stack.
-    const provider = Stack.of(this).node.findChild(
-      `AWS${AwsCustomResource.PROVIDER_FUNCTION_UUID.replace(/-/g, '')}`,
-    );
-    Validations.of(provider).acknowledge({
-      id: 'AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]',
-      reason:
-        'CDK-managed provider role of the custom resource that looks up the IoT endpoint.',
-    });
   }
 }
 
@@ -70,6 +83,7 @@ export class IotCore extends Construct {
   readonly thingType: CfnThingType;
   readonly devicePolicy: CfnPolicy;
   readonly topicRule: CfnTopicRule;
+  readonly ruleName: string;
 
   constructor(scope: Construct, id: string, props: IotCoreProps) {
     super(scope, id);
@@ -119,12 +133,28 @@ export class IotCore extends Construct {
 
     // topic(1)='fotoko', topic(2)='printers', topic(3)=printerId, topic(4)=jobs|status|heartbeat.
     // The WHERE clause keeps the rule from firing on the cloud's own `jobs` publishes.
+    this.ruleName = `fotoko_${props.config.stage}_printer_status`;
+    // Failed rule actions (for example a throttled Lambda) are logged instead of dropped silently.
+    const errorLogs = new LogGroup(this, 'RuleErrorLogs', {
+      retention: props.config.logRetention,
+      removalPolicy: props.config.removalPolicy,
+    });
+    const errorRole = new Role(this, 'RuleErrorRole', {
+      assumedBy: new ServicePrincipal('iot.amazonaws.com'),
+    });
+    errorLogs.grantWrite(errorRole);
     this.topicRule = new CfnTopicRule(this, 'PrinterStatusRule', {
-      ruleName: `fotoko_${props.config.stage}_printer_status`,
+      ruleName: this.ruleName,
       topicRulePayload: {
         sql: `SELECT *, topic(3) AS printerId FROM '${TOPIC_ROOT}/+/+' WHERE topic(4) = 'status' OR topic(4) = 'heartbeat'`,
         awsIotSqlVersion: '2016-03-23',
         ruleDisabled: false,
+        errorAction: {
+          cloudwatchLogs: {
+            logGroupName: errorLogs.logGroupName,
+            roleArn: errorRole.roleArn,
+          },
+        },
         actions: [
           { lambda: { functionArn: props.statusFunction.functionArn } },
         ],

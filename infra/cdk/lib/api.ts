@@ -1,6 +1,7 @@
 import { Duration, Stack, Validations } from 'aws-cdk-lib';
 import {
   CfnApi,
+  CfnStage,
   CorsHttpMethod,
   HttpApi,
   HttpMethod,
@@ -15,7 +16,7 @@ import type { IFunction } from 'aws-cdk-lib/aws-lambda';
 import { LogGroup } from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
 import type { StageConfig } from './config';
-import { findingId } from './nag';
+import { iam5Resource } from './nag';
 
 interface RouteSpec {
   readonly method: HttpMethod;
@@ -95,6 +96,23 @@ export class Api extends Construct {
       },
     });
 
+    // Per-route budgets: the webhook has its own, customer order routes sit below the stage default.
+    const routeSettings: Record<string, object> = {};
+    for (const spec of ROUTES) {
+      const budget = spec.path.endsWith('/payos/webhook')
+        ? config.webhookThrottle
+        : spec.iam
+          ? config.orderThrottle
+          : undefined;
+      if (budget) {
+        routeSettings[`${spec.method} ${spec.path}`] = {
+          ThrottlingRateLimit: budget.rateLimit,
+          ThrottlingBurstLimit: budget.burstLimit,
+        };
+      }
+    }
+    (this.stage.node.defaultChild as CfnStage).routeSettings = routeSettings;
+
     const integration = new HttpLambdaIntegration(
       'FotokoHttp',
       props.httpFunction,
@@ -138,9 +156,9 @@ export class Api extends Construct {
     );
     const stack = Stack.of(this);
     return ROUTES.filter((r) => r.iam && r.invokePath.includes('*')).map((r) =>
-      findingId(
+      iam5Resource(
         stack,
-        `AwsSolutions-IAM5[Resource::arn:${stack.partition}:execute-api:${stack.region}:${stack.account}:<${apiId}>/${this.stage.stageName}/${r.method}${r.invokePath}]`,
+        `arn:${stack.partition}:execute-api:${stack.region}:${stack.account}:<${apiId}>/${this.stage.stageName}/${r.method}${r.invokePath}`,
       ),
     );
   }

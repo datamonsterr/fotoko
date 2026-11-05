@@ -73,7 +73,7 @@ export class Data extends Construct {
         {
           allowedMethods: [HttpMethods.PUT, HttpMethods.GET],
           allowedOrigins: [...props.appOrigins],
-          allowedHeaders: ['*'],
+          allowedHeaders: ['content-type', 'x-amz-*'],
           exposedHeaders: ['ETag'],
           maxAge: 3000,
         },

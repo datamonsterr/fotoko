@@ -14,10 +14,13 @@ const extra = (app.node.tryGetContext('extraOrigins') as string | undefined)
   ?.split(',')
   .filter(Boolean);
 
+const alarmEmail = app.node.tryGetContext('alarmEmail') as string | undefined;
+
 new FotokoStack(app, `Fotoko-${stage}`, {
   stage,
   deployWeb: String(app.node.tryGetContext('deployWeb')) === 'true',
   ...(extra ? { extraOrigins: extra } : {}),
+  ...(alarmEmail ? { alarmEmail } : {}),
 });
 applyNag(app);
 app.synth();
