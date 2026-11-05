@@ -4,6 +4,9 @@ import { expect, test } from '@playwright/test';
 
 import { printedPages, simEnv } from './sim';
 
+const escapeRegExp = (text: string) =>
+  text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 const photo = path.join(import.meta.dirname, '..', 'fixtures', 'photo.jpg');
 
 test('a customer scans, uploads, pays and the photo is printed', async ({
@@ -33,7 +36,7 @@ test('a customer scans, uploads, pays and the photo is printed', async ({
 
   // Upload and checkout lead to the (mock) payOS page in the same tab.
   await page.getByTestId('picker-continue').click();
-  await page.waitForURL(new RegExp(`^${payos}/web/\\d+$`));
+  await page.waitForURL(new RegExp(`^${escapeRegExp(payos)}/web/\\d+$`));
   await expect(page.locator('#payos-amount')).toContainText('20000');
   await page.getByRole('button', { name: 'Pay' }).click();
 

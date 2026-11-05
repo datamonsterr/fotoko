@@ -8,6 +8,11 @@
 # docker-compose.test.yml.
 name: fotoko
 
+x-tcp-check: &tcp-check
+  interval: 2s
+  timeout: 3s
+  retries: 30
+
 x-payos: &payos
   PAYOS_CLIENT_ID: local-client-id
   PAYOS_API_KEY: local-api-key
@@ -20,6 +25,9 @@ services:
       context: .
       dockerfile: docker/rust.Dockerfile
       target: broker
+    healthcheck:
+      <<: *tcp-check
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/1883']
 
   # fotoko-local: the HTTP API on in-memory repos and local-fs photo storage.
   api:
@@ -36,9 +44,14 @@ services:
       # What the browser and the Pi use to reach the app: photo URLs and payOS return URLs.
       FOTOKO_LOCAL_PUBLIC_URL: http://localhost:8081
       PUBLIC_APP_URL: http://localhost:8081
+    healthcheck:
+      <<: *tcp-check
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/8787']
     depends_on:
-      - broker
-      - payos-mock
+      broker:
+        condition: service_healthy
+      payos-mock:
+        condition: service_healthy
 
   # Hosted checkout page with a "Pay" button; sends the signed webhook to the API.
   payos-mock:
@@ -53,6 +66,9 @@ services:
       PAYOS_MOCK_PUBLIC_URL: http://localhost:8082
     ports:
       - '127.0.0.1:8082:8082'
+    healthcheck:
+      <<: *tcp-check
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/8082']
 
   # Expo web app (local mode) plus a proxy to the API, so the browser sees one origin.
   web:
@@ -65,8 +81,16 @@ services:
       API_URL: http://api:8787
     ports:
       - '127.0.0.1:8081:8081'
+    healthcheck:
+      <<: *tcp-check
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8081/').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   # Pi agent on the printer simulation. It shares the web container's network namespace so that
   # the photo URLs the API hands out (http://localhost:8081/...) work for the agent as well.
@@ -80,8 +104,10 @@ services:
       - ./docker/pi-agent.toml:/etc/fotoko/agent.toml:ro
       - sim-out:/var/lib/fotoko/sim-out
     depends_on:
-      - broker
-      - web
+      broker:
+        condition: service_healthy
+      web:
+        condition: service_healthy
 
 volumes:
   sim-out:
