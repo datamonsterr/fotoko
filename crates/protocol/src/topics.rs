@@ -80,29 +80,28 @@ pub fn parse_topic(topic: &str) -> Result<(PrinterId, TopicKind), TopicError> {
     if *fotoko != "fotoko" || *printers != "printers" {
         return Err(TopicError::Malformed(topic.to_owned()));
     }
-    if id.is_empty() || id.contains(['+', '#']) {
-        return Err(TopicError::InvalidPrinterId((*id).to_owned()));
-    }
     let kind = TopicKind::parse(kind).ok_or_else(|| TopicError::UnknownKind((*kind).to_owned()))?;
-    Ok((PrinterId::from(*id), kind))
+    let id = PrinterId::new(*id).map_err(|_| TopicError::InvalidPrinterId((*id).to_owned()))?;
+    Ok((id, kind))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::tests::pid;
 
     #[test]
     fn builders_produce_contract_topics() {
         assert_eq!(
-            jobs_topic(&"stand-001".into()),
+            jobs_topic(&pid("stand-001")),
             "fotoko/printers/stand-001/jobs"
         );
         assert_eq!(
-            status_topic(&"stand-001".into()),
+            status_topic(&pid("stand-001")),
             "fotoko/printers/stand-001/status"
         );
         assert_eq!(
-            heartbeat_topic(&"stand-001".into()),
+            heartbeat_topic(&pid("stand-001")),
             "fotoko/printers/stand-001/heartbeat"
         );
     }
@@ -117,8 +116,8 @@ mod tests {
     #[test]
     fn parse_round_trips_every_kind() {
         for kind in [TopicKind::Jobs, TopicKind::Status, TopicKind::Heartbeat] {
-            let parsed = parse_topic(&topic(&"p-1".into(), kind));
-            assert_eq!(parsed, Ok(("p-1".into(), kind)));
+            let parsed = parse_topic(&topic(&pid("p-1"), kind));
+            assert_eq!(parsed, Ok((pid("p-1"), kind)));
         }
     }
 

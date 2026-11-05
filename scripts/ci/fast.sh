@@ -6,6 +6,11 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+if [ ! -d node_modules ]; then
+    echo "fast: ERROR: node_modules is missing, run 'pnpm install' first" >&2
+    exit 1
+fi
+
 BASE="$(git merge-base origin/main HEAD 2>/dev/null)" || BASE=""
 
 ALL=0
@@ -68,9 +73,11 @@ if has_crates; then
     RUN_TESTS=1
     if [ "$RUST_ALL" -eq 0 ]; then
         PKG_ARGS=()
+        # Capture first so a failing selector aborts the script (set -e) instead of failing open.
+        SEL="$(selected_crates)"
         while IFS= read -r name; do
             [ -n "$name" ] && PKG_ARGS+=(-p "$name")
-        done < <(selected_crates)
+        done <<<"$SEL"
         [ "${#PKG_ARGS[@]}" -gt 0 ] || RUN_TESTS=0
     fi
     echo "fast: rust fmt + clippy (workspace), tests: ${PKG_ARGS[*]:-none}"
@@ -89,11 +96,6 @@ else
 fi
 
 # --- pnpm / turbo / Prettier ---
-if [ ! -d node_modules ]; then
-    echo "fast: ERROR: node_modules is missing, run 'pnpm install' first" >&2
-    exit 1
-fi
-
 if has_js; then
     if [ "$ALL" -eq 1 ]; then
         FILTER=()
@@ -101,7 +103,7 @@ if has_js; then
         FILTER=("--filter=...[${BASE}]")
     fi
     echo "fast: turbo ${FILTER[*]:-all}"
-    pnpm exec turbo run lint typecheck test "${FILTER[@]}"
+    pnpm exec turbo run lint typecheck test ${FILTER[@]+"${FILTER[@]}"}
 else
     echo "fast: no pnpm packages"
 fi

@@ -131,6 +131,7 @@ pub struct Heartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::tests::pid;
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
 
@@ -154,7 +155,7 @@ mod tests {
         let job = PrintJob {
             job_id: "j1".into(),
             order_id: "o1".into(),
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             media: Media::Photo4x6,
             created_at: ts("2026-01-01T00:00:00Z"),
             photos: vec![JobPhoto {
@@ -202,7 +203,7 @@ mod tests {
         let status = JobStatus {
             job_id: "j1".into(),
             order_id: "o1".into(),
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             state: JobState::Printing,
             printed_copies: 1,
             error: None,
@@ -220,7 +221,7 @@ mod tests {
         let status = JobStatus {
             job_id: "j1".into(),
             order_id: "o1".into(),
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             state: JobState::Failed,
             printed_copies: 0,
             error: Some(PiError {
@@ -249,7 +250,7 @@ mod tests {
     #[test]
     fn heartbeat() {
         let hb = Heartbeat {
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             printer_state: PrinterState::Offline,
             agent_version: "0.1.0".into(),
             at: ts("2026-01-01T00:00:00Z"),
