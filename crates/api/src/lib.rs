@@ -2,9 +2,12 @@
 //! and the local/sim server. See `docs/contracts.md`.
 
 pub mod api;
+pub mod aws;
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod ids;
+pub mod payos;
 
 pub use api::{AppState, router};
 pub use error::ApiError;
