@@ -243,6 +243,7 @@ pub async fn image_server() -> String {
     let mut huge = vec![0u8; 16 * 1024 * 1024];
     huge[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     let (jpg, png) = (jpeg_landscape(), png_portrait());
+    let (jpg2, flaky) = (jpg.clone(), Arc::new(std::sync::atomic::AtomicU32::new(0)));
     let (png2, huge) = (png.clone(), Arc::new(huge));
     let app = Router::new()
         .route("/land.jpg", get(move || async move { jpg }))
@@ -250,6 +251,20 @@ pub async fn image_server() -> String {
         .route("/mislabeled.jpg", get(move || async move { png2 }))
         .route("/text.jpg", get(|| async { "this is not an image at all" }))
         .route("/gone", get(|| async { StatusCode::NOT_FOUND }))
+        .route(
+            "/flaky.jpg",
+            get(move || {
+                let (flaky, jpg) = (Arc::clone(&flaky), jpg2.clone());
+                async move {
+                    // The first request fails like an expired presigned URL, later ones work.
+                    if flaky.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Err(StatusCode::FORBIDDEN)
+                    } else {
+                        Ok(jpg)
+                    }
+                }
+            }),
+        )
         .route("/huge.png", get(move || async move { huge.to_vec() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();

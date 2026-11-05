@@ -154,9 +154,14 @@ pub struct SimSection {
 pub struct StorageConfig {
     /// Directory for the dedupe file and temporary downloads.
     pub state_dir: PathBuf,
-    /// Allow `http://` image URLs (simulation only).
+    /// Allow `http://` image URLs from any host, loopback included. Simulation only: it is
+    /// rejected unless `printer.backend = "sim"`.
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Hosts image URLs may point at: `.suffix` entries match subdomains, others match exactly.
+    /// Ignored when `allow_insecure_http` is set.
+    #[serde(default = "default_allowed_hosts")]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// `[agent]`
@@ -203,6 +208,9 @@ pub struct Config {
     pub agent: AgentSection,
 }
 
+fn default_allowed_hosts() -> Vec<String> {
+    vec![".amazonaws.com".to_owned()]
+}
 fn default_true() -> bool {
     true
 }
@@ -324,6 +332,23 @@ impl Config {
             return Err(invalid(
                 "sim",
                 "section required when printer.backend = \"sim\"",
+            ));
+        }
+        if self.storage.allow_insecure_http && self.printer.backend != Backend::Sim {
+            return Err(invalid(
+                "storage.allow_insecure_http",
+                "only allowed with printer.backend = \"sim\"",
+            ));
+        }
+        if self
+            .storage
+            .allowed_hosts
+            .iter()
+            .any(|h| h.trim().is_empty() || h.trim() == ".")
+        {
+            return Err(invalid(
+                "storage.allowed_hosts",
+                "entries must not be empty",
             ));
         }
         if self.storage.state_dir.as_os_str().is_empty() {
@@ -595,6 +620,45 @@ state_dir = "/tmp/state"
             "",
         );
         assert!(Config::from_toml(&cups_no_sim).unwrap().sim.is_none());
+    }
+
+    #[test]
+    fn allowed_hosts_default_and_validation() {
+        let c = Config::from_toml(LOCAL).unwrap();
+        assert_eq!(c.storage.allowed_hosts, vec![".amazonaws.com".to_owned()]);
+        let text = with(
+            LOCAL,
+            "state_dir = \"/tmp/state\"",
+            "state_dir = \"/tmp/state\"\nallowed_hosts = [\".a.com\", \"b.org\"]",
+        );
+        assert_eq!(
+            Config::from_toml(&text)
+                .unwrap()
+                .storage
+                .allowed_hosts
+                .len(),
+            2
+        );
+        for bad in ["\"\"", "\" \"", "\".\""] {
+            let text = with(
+                LOCAL,
+                "state_dir = \"/tmp/state\"",
+                &format!("state_dir = \"/tmp/state\"\nallowed_hosts = [{bad}]"),
+            );
+            assert!(err(&text).contains("allowed_hosts"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn insecure_http_requires_the_sim_backend() {
+        let on = with(
+            LOCAL,
+            "state_dir = \"/tmp/state\"",
+            "state_dir = \"/tmp/state\"\nallow_insecure_http = true",
+        );
+        assert!(Config::from_toml(&on).unwrap().storage.allow_insecure_http);
+        let cups = on.replace("backend = \"sim\"", "backend = \"cups\"");
+        assert!(err(&cups).contains("allow_insecure_http"));
     }
 
     #[test]

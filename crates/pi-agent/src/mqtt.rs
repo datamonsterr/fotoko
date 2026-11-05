@@ -134,7 +134,8 @@ impl Sink for MqttSink {
     fn heartbeat(&self, heartbeat: &Heartbeat) -> Result<(), MqttError> {
         let payload = serde_json::to_vec(heartbeat)?;
         self.client
-            .try_publish(&self.heartbeat_topic, QoS::AtLeastOnce, false, payload)
+            // QoS 0: a heartbeat that is late is useless, so it is never queued for redelivery.
+            .try_publish(&self.heartbeat_topic, QoS::AtMostOnce, false, payload)
             .map_err(|e| MqttError::Publish(e.to_string()))
     }
 }

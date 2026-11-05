@@ -5,6 +5,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use fotoko_protocol::{Media, PiError, PiErrorCode, PrinterState};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 /// Why a print failed. Each variant maps to one Pi error code.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -24,6 +25,9 @@ pub enum PrintError {
     /// CUPS or driver failure (`driver_error`).
     #[error("driver error: {0}")]
     Driver(String),
+    /// The print was withdrawn because the agent is shutting down (`driver_error`).
+    #[error("print cancelled")]
+    Cancelled,
 }
 
 impl PrintError {
@@ -34,7 +38,7 @@ impl PrintError {
             Self::RibbonOut => PiErrorCode::RibbonOut,
             Self::Offline(_) => PiErrorCode::PrinterOffline,
             Self::InvalidImage(_) => PiErrorCode::InvalidImage,
-            Self::Driver(_) => PiErrorCode::DriverError,
+            Self::Driver(_) | Self::Cancelled => PiErrorCode::DriverError,
         }
     }
 
@@ -47,11 +51,37 @@ impl PrintError {
     }
 }
 
+/// Per-print context.
+#[derive(Debug, Clone)]
+pub struct PrintContext {
+    /// Human readable job title (the job id); CUPS shows it in its queue.
+    pub title: String,
+    /// Fires when the print must be withdrawn. Implementations stop waiting, cancel any queued
+    /// work and return [`PrintError::Cancelled`].
+    pub cancel: CancellationToken,
+}
+
+impl PrintContext {
+    /// A context that is never cancelled.
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
 /// A printer that prints one image file at a time.
 #[async_trait]
 pub trait Printer: Send + Sync {
     /// Print `copies` copies of the image at `file` on `media`; returns when all are printed.
-    async fn print(&self, file: &Path, copies: u32, media: Media) -> Result<(), PrintError>;
+    async fn print(
+        &self,
+        file: &Path,
+        copies: u32,
+        media: Media,
+        ctx: &PrintContext,
+    ) -> Result<(), PrintError>;
 
     /// Current state for the heartbeat.
     async fn state(&self) -> PrinterState;
@@ -100,5 +130,12 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn context_defaults_to_not_cancelled() {
+        let ctx = PrintContext::new("job-1");
+        assert_eq!(ctx.title, "job-1");
+        assert!(!ctx.cancel.is_cancelled());
     }
 }

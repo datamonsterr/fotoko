@@ -1,10 +1,10 @@
-//! Fake CUPS `lp` command. See `fotoko_printer_sim::fake_cups`.
+//! Fake CUPS `lp` command. See `fotoko_printer_sim::runner`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::{stderr, stdin, stdout};
 use std::process::ExitCode;
 
-use fotoko_printer_sim::fake_cups::{Command, run};
+use fotoko_printer_sim::runner::{Command, run};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

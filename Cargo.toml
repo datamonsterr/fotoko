@@ -56,6 +56,58 @@ incremental = false
 [profile.test.package."*"]
 debug = false
 
+# Image decoding and resizing are far too slow unoptimized (printer-sim and pi-agent tests).
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.moxcms]
+opt-level = 3
+[profile.dev.package.pxfm]
+opt-level = 3
+[profile.test.package.image]
+opt-level = 3
+[profile.test.package.png]
+opt-level = 3
+[profile.test.package.zune-jpeg]
+opt-level = 3
+[profile.test.package.zune-core]
+opt-level = 3
+[profile.test.package.fdeflate]
+opt-level = 3
+[profile.test.package.flate2]
+opt-level = 3
+[profile.test.package.miniz_oxide]
+opt-level = 3
+[profile.test.package.simd-adler32]
+opt-level = 3
+[profile.test.package.crc32fast]
+opt-level = 3
+[profile.test.package.moxcms]
+opt-level = 3
+[profile.test.package.pxfm]
+opt-level = 3
+
+# Generic image code is monomorphized in the calling crate.
+[profile.dev.package.fotoko-printer-sim]
+opt-level = 3
+[profile.test.package.fotoko-printer-sim]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

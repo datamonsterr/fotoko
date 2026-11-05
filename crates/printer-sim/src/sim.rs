@@ -16,6 +16,8 @@ use crate::fit::fit_to_page;
 
 /// Largest image edge the simulation decodes.
 const MAX_EDGE_PX: u32 = 20_000;
+/// Largest image the simulation accepts, in pixels (50 megapixels).
+const MAX_PIXELS: u64 = 50_000_000;
 /// Decoder allocation cap (bytes).
 const MAX_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -223,7 +225,12 @@ pub fn probe_file(path: &Path) -> Result<ImageInfo, SimError> {
     let (width, height) = reader
         .into_dimensions()
         .map_err(|e| SimError::InvalidImage(e.to_string()))?;
-    if width == 0 || height == 0 || width > MAX_EDGE_PX || height > MAX_EDGE_PX {
+    if width == 0
+        || height == 0
+        || width > MAX_EDGE_PX
+        || height > MAX_EDGE_PX
+        || u64::from(width) * u64::from(height) > MAX_PIXELS
+    {
         return Err(SimError::InvalidImage(format!(
             "unsupported size {width}x{height}"
         )));
@@ -607,6 +614,38 @@ mod tests {
         let huge = dir.path().join("huge.png");
         fs::write(&huge, bytes).unwrap();
         assert!(matches!(probe_file(&huge), Err(SimError::InvalidImage(_))));
+    }
+
+    /// Rewrite the size in a PNG's IHDR chunk and fix its CRC.
+    fn set_png_size(bytes: &mut [u8], width: u32, height: u32) {
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in &bytes[12..29] {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+    }
+
+    #[test]
+    fn probe_rejects_more_than_fifty_megapixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_image(dir.path(), "ok.png", 4, 4, ImageFormat::Png);
+        let mut bytes = fs::read(&png).unwrap();
+        set_png_size(&mut bytes, 10_000, 10_000);
+        let big = dir.path().join("big.png");
+        fs::write(&big, &bytes).unwrap();
+        assert!(matches!(probe_file(&big), Err(SimError::InvalidImage(m)) if m.contains("size")));
+        set_png_size(&mut bytes, 10_000, 5_000); // exactly 50 MP is accepted
+        fs::write(&big, bytes).unwrap();
+        assert!(probe_file(&big).is_ok());
     }
 
     #[test]

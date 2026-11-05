@@ -79,7 +79,7 @@ async fn sigterm_shuts_down_cleanly_after_serving_a_job() {
         cloud.job_statuses().await.last().unwrap().state,
         JobState::Completed
     );
-    assert!(state.path().join("sim/job-bin-ph0-1.png").exists());
+    assert!(state.path().join("sim/job-bin-0-ph0-1.png").exists());
 
     let kill = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])

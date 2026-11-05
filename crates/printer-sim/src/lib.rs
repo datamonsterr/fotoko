@@ -8,6 +8,7 @@
 pub mod cups_cli;
 pub mod fake_cups;
 pub mod fit;
+pub mod runner;
 pub mod sim;
 
 pub use sim::{
