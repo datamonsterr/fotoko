@@ -287,11 +287,7 @@ impl LocalAppBuilder {
         }
 
         let router = with_request_context(
-            api_routes(AppState {
-                service: service.clone(),
-                identity_mode: IdentityMode::Local,
-            })
-            .merge(objects.routes()),
+            api_routes(AppState::new(service.clone(), IdentityMode::Local)).merge(objects.routes()),
         );
         Ok(LocalApp {
             router,

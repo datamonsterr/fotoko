@@ -29,12 +29,14 @@ use fotoko_core::{
 };
 use fotoko_protocol::{ContentType, OrderStatus, PrinterId, PrinterStatus};
 
+/// The tests are `#[ignore]`d; running them (`--include-ignored`) without `FOTOKO_IT=1` is a
+/// mistake and fails loudly instead of passing without testing anything.
 fn enabled() -> bool {
-    let on = std::env::var("FOTOKO_IT").is_ok_and(|v| v == "1");
-    if !on {
-        eprintln!("skipped: set FOTOKO_IT=1 and start docker-compose.test.yml");
-    }
-    on
+    assert!(
+        std::env::var("FOTOKO_IT").is_ok_and(|v| v == "1"),
+        "these tests need FOTOKO_IT=1 and `docker compose -f docker-compose.test.yml up -d`"
+    );
+    true
 }
 
 fn at(text: &str) -> DateTime<Utc> {
@@ -723,11 +725,21 @@ async fn corrupt_items_are_internal_errors() {
         repo.get(&"bad".into()).await,
         Err(CoreError::Internal(_))
     ));
-    assert!(matches!(
-        repo.list_due_for_expiry(at("2026-01-02T00:00:00Z"), 5)
-            .await,
-        Err(CoreError::Internal(_))
-    ));
+    // The due sweep skips the corrupt item and still returns the good one.
+    repo.insert(&order(
+        "good",
+        OrderStatus::AwaitingUpload,
+        None,
+        "2026-01-01T00:30:00Z",
+    ))
+    .await
+    .unwrap();
+    let due = repo
+        .list_due_for_expiry(at("2026-01-02T00:00:00Z"), 5)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].order_id.as_str(), "good");
     // A reservation without its order is "not found", not an error.
     client
         .put_item()
@@ -739,4 +751,58 @@ async fn corrupt_items_are_internal_errors() {
         .await
         .unwrap();
     assert_eq!(repo.get_by_order_code(77).await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "needs docker compose; set FOTOKO_IT=1"]
+async fn status_updates_after_checkout_do_not_rewrite_the_reservation() {
+    if !enabled() {
+        return;
+    }
+    let (repo, client, name) = repo().await;
+    let o = order(
+        "o1",
+        OrderStatus::AwaitingUpload,
+        None,
+        "2026-01-01T00:15:00Z",
+    );
+    repo.insert(&o).await.unwrap();
+    let mut paying = o.clone();
+    paying.status = OrderStatus::AwaitingPayment;
+    paying.order_code = Some(31);
+    repo.update(&paying, OrderStatus::AwaitingUpload)
+        .await
+        .unwrap();
+
+    // Mark the reservation; a plain status update must leave it alone.
+    client
+        .update_item()
+        .table_name(&name)
+        .key("pk", AttributeValue::S("ORDERCODE#31".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .update_expression("SET marker = :m")
+        .expression_attribute_values(":m", AttributeValue::S("untouched".into()))
+        .send()
+        .await
+        .unwrap();
+    let mut paid = paying.clone();
+    paid.status = OrderStatus::Paid;
+    repo.update(&paid, OrderStatus::AwaitingPayment)
+        .await
+        .unwrap();
+    let reservation = client
+        .get_item()
+        .table_name(&name)
+        .key("pk", AttributeValue::S("ORDERCODE#31".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(reservation["marker"].as_s().unwrap(), "untouched");
+    assert_eq!(
+        repo.get(&"o1".into()).await.unwrap().unwrap().status,
+        OrderStatus::Paid
+    );
 }

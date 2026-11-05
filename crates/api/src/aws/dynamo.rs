@@ -6,9 +6,10 @@
 //! | order | `ORDER#{orderId}` | `META` |
 //! | order-code reservation | `ORDERCODE#{orderCode}` | `META` (attribute `orderId`) |
 //!
-//! Order codes are unique because every write that sets one goes through a
+//! Order codes are unique because every write that first sets (or changes) one goes through a
 //! `TransactWriteItems` that also puts the reservation item, guarded by `attribute_not_exists`
-//! (or by "already reserved for this very order" for later updates). `get_by_order_code` reads
+//! (or by "already reserved for this very order"). Later updates of an order that already holds
+//! its code are a single conditional `PutItem`. `get_by_order_code` reads
 //! the reservation with a consistent read, so a webhook right after checkout cannot miss it,
 //! which an eventually consistent GSI query could.
 //!
@@ -425,47 +426,32 @@ impl DynamoOrderRepo {
         }
     }
 
-    /// Run `order_write` alone, or in one transaction with the order-code reservation.
-    async fn write(
-        &self,
-        order: &Order,
-        order_write: Put,
-        exclusive_code: bool,
-        missing: MissingOrder,
-    ) -> Result<(), CoreError> {
-        match order.order_code {
-            Some(code) => {
-                let reservation = self.reservation(order, code, exclusive_code)?;
-                let writes = [order_write, reservation]
-                    .into_iter()
-                    .map(|put| TransactWriteItem::builder().put(put).build())
-                    .collect();
-                self.transact(writes, order, missing).await
+    /// A single conditional `PutItem`. `Ok(false)` when the condition failed.
+    async fn put_item(&self, put: Put) -> Result<bool, CoreError> {
+        let result = self
+            .client
+            .put_item()
+            .table_name(put.table_name)
+            .set_item(Some(put.item))
+            .set_condition_expression(put.condition_expression)
+            .set_expression_attribute_names(put.expression_attribute_names)
+            .set_expression_attribute_values(put.expression_attribute_values)
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(SdkError::ServiceError(se))
+                if matches!(se.err(), PutItemError::ConditionalCheckFailedException(_)) =>
+            {
+                Ok(false)
             }
-            None => {
-                let put = order_write;
-                let result = self
-                    .client
-                    .put_item()
-                    .table_name(put.table_name)
-                    .set_item(Some(put.item))
-                    .set_condition_expression(Some(put.condition_expression.unwrap_or_default()))
-                    .set_expression_attribute_names(put.expression_attribute_names)
-                    .set_expression_attribute_values(put.expression_attribute_values)
-                    .send()
-                    .await;
-                match result {
-                    Ok(_) => Ok(()),
-                    Err(SdkError::ServiceError(se))
-                        if matches!(se.err(), PutItemError::ConditionalCheckFailedException(_)) =>
-                    {
-                        self.order_condition_failed(order, missing).await
-                    }
-                    Err(error) => Err(storage_error("put_item", &error)),
-                }
-            }
+            Err(error) => Err(storage_error("put_item", &error)),
         }
     }
+}
+
+fn tx_put(put: Put) -> TransactWriteItem {
+    TransactWriteItem::builder().put(put).build()
 }
 
 /// What a failed order condition means.
@@ -495,21 +481,69 @@ impl OrderRepo for DynamoOrderRepo {
     }
 
     async fn insert(&self, order: &Order) -> Result<(), CoreError> {
-        let item = order_to_item(order)?;
-        let put = self.put(item, "attribute_not_exists(pk)", Item::new())?;
-        self.write(order, put, true, MissingOrder::Exists).await
+        let put = self.put(
+            order_to_item(order)?,
+            "attribute_not_exists(pk)",
+            Item::new(),
+        )?;
+        match order.order_code {
+            None => {
+                if self.put_item(put).await? {
+                    Ok(())
+                } else {
+                    self.order_condition_failed(order, MissingOrder::Exists)
+                        .await
+                }
+            }
+            Some(code) => {
+                let reservation = self.reservation(order, code, true)?;
+                self.transact(
+                    vec![tx_put(put), tx_put(reservation)],
+                    order,
+                    MissingOrder::Exists,
+                )
+                .await
+            }
+        }
     }
 
+    /// Without an order code this is one conditional `PutItem`. With one, the common case is
+    /// that the stored order already holds the code (a later status change): a single `PutItem`
+    /// guarded by `orderCode = :code` is enough and no reservation is written. Only when that
+    /// fails (the code is new or changes, or the status is wrong) does a transaction put the
+    /// order and its reservation together, which also yields the precise error.
     async fn update(&self, order: &Order, expected: OrderStatus) -> Result<(), CoreError> {
         let item = order_to_item(order)?;
-        let put = self.put(
-            item,
-            "#st = :expected",
-            Item::from([(":expected".to_owned(), s(status_text(expected)?))]),
+        let expected_value = (":expected".to_owned(), s(status_text(expected)?));
+        let Some(code) = order.order_code else {
+            let put = self.put(item, "#st = :expected", Item::from([expected_value]))?;
+            return if self.put_item(put).await? {
+                Ok(())
+            } else {
+                self.order_condition_failed(order, MissingOrder::NotFound)
+                    .await
+            };
+        };
+        let fast = self.put(
+            item.clone(),
+            "#st = :expected AND orderCode = :code",
+            Item::from([expected_value.clone(), (":code".to_owned(), n(code))]),
         )?;
-        self.write(order, put, false, MissingOrder::NotFound).await
+        if self.put_item(fast).await? {
+            return Ok(());
+        }
+        let put = self.put(item, "#st = :expected", Item::from([expected_value]))?;
+        let reservation = self.reservation(order, code, false)?;
+        self.transact(
+            vec![tx_put(put), tx_put(reservation)],
+            order,
+            MissingOrder::NotFound,
+        )
+        .await
     }
 
+    /// One index page of at most `limit` due orders, oldest expiry first, in a single `Query`
+    /// (no pagination token is followed): the service calls again until nothing is returned.
     async fn list_due_for_expiry(
         &self,
         now: DateTime<Utc>,
@@ -528,10 +562,21 @@ impl OrderRepo for DynamoOrderRepo {
             .send()
             .await
             .map_err(|e| storage_error("query", &e))?;
-        out.items()
-            .iter()
-            .map(order_from_item)
-            .collect::<Result<Vec<_>, _>>()
+        // One unreadable item must not stop the sweep of all the others: log it and move on.
+        // (It stays in the index; if a whole page is unreadable, the sweep cannot see past it
+        // until someone repairs those items, which the error log points at.)
+        let mut orders = Vec::with_capacity(out.items().len());
+        for item in out.items() {
+            match order_from_item(item) {
+                Ok(order) => orders.push(order),
+                Err(error) => tracing::error!(
+                    pk = item.get("pk").and_then(|v| v.as_s().ok()).map_or("?", String::as_str),
+                    %error,
+                    "skipping a corrupt item in the due index"
+                ),
+            }
+        }
+        Ok(orders)
     }
 }
 
@@ -562,6 +607,7 @@ impl PrinterRepo for DynamoPrinterRepo {
             .get_item()
             .table_name(&self.table)
             .set_key(Some(key(printer_pk(printer_id))))
+            .consistent_read(true)
             .send()
             .await
             .map_err(|e| storage_error("get_item", &e))?;

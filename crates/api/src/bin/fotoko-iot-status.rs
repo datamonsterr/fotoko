@@ -1,7 +1,7 @@
 //! IoT rule Lambda: applies Pi job statuses and heartbeats.
 
-use fotoko_api::aws::{sdk_config, status_service};
-use fotoko_api::config::{IotStatusConfig, Mode, process_env};
+use fotoko_api::aws::{sdk_config, table_service};
+use fotoko_api::config::{Mode, TableConfig, process_env};
 use fotoko_api::status::handle_event;
 use fotoko_api::telemetry;
 use lambda_runtime::{Error, LambdaEvent, service_fn};
@@ -13,8 +13,8 @@ async fn main() -> Result<(), Error> {
     if Mode::from_lookup(&process_env)? != Mode::Aws {
         return Err("fotoko-iot-status only runs with FOTOKO_MODE=aws".into());
     }
-    let config = IotStatusConfig::from_lookup(&process_env)?;
-    let service = status_service(&config, &sdk_config().await)?;
+    let config = TableConfig::from_lookup(&process_env)?;
+    let service = table_service(&config, &sdk_config().await)?;
     lambda_runtime::run(service_fn(move |event: LambdaEvent<Value>| {
         let service = service.clone();
         async move {

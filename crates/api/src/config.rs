@@ -150,16 +150,16 @@ impl HttpConfig {
     }
 }
 
-/// Settings of the `fotoko-iot-status` Lambda: it only touches the table.
+/// Settings of the Lambdas that only touch the table (`fotoko-iot-status`, `fotoko-expire`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IotStatusConfig {
+pub struct TableConfig {
     /// DynamoDB table.
     pub table_name: String,
     /// Price used when a printer item has none.
     pub default_price_vnd: u64,
 }
 
-impl IotStatusConfig {
+impl TableConfig {
     /// Parse and validate.
     pub fn from_lookup(lookup: Lookup<'_>) -> Result<Self, ConfigError> {
         Ok(Self {
@@ -395,15 +395,15 @@ mod tests {
 
     #[test]
     fn iot_status_config_needs_only_the_table() {
-        let cfg = IotStatusConfig::from_lookup(&env(&[("TABLE_NAME", "t")])).expect("valid");
+        let cfg = TableConfig::from_lookup(&env(&[("TABLE_NAME", "t")])).expect("valid");
         assert_eq!(cfg.table_name, "t");
         assert_eq!(cfg.default_price_vnd, 10_000);
         assert_eq!(
-            IotStatusConfig::from_lookup(&env(&[])),
+            TableConfig::from_lookup(&env(&[])),
             Err(ConfigError::Missing("TABLE_NAME"))
         );
         assert!(
-            IotStatusConfig::from_lookup(&env(&[("TABLE_NAME", "t"), ("DEFAULT_PRICE_VND", "x")]))
+            TableConfig::from_lookup(&env(&[("TABLE_NAME", "t"), ("DEFAULT_PRICE_VND", "x")]))
                 .is_err()
         );
     }

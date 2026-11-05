@@ -225,12 +225,17 @@ async fn write_atomically(path: &FsPath, data: &[u8]) -> Result<(), CoreError> {
             .map_err(|e| io("cannot create the object directory", e))?;
     }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, data)
-        .await
-        .map_err(|e| io("cannot write the object", e))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .map_err(|e| io("cannot store the object", e))
+    let written = match tokio::fs::write(&tmp, data).await {
+        Ok(()) => tokio::fs::rename(&tmp, path)
+            .await
+            .map_err(|e| io("cannot store the object", e)),
+        Err(e) => Err(io("cannot write the object", e)),
+    };
+    if written.is_err() {
+        // Best effort: do not leave half-written temp files behind.
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    written
 }
 
 async fn get_object(
@@ -540,6 +545,26 @@ mod tests {
                 .0,
             500
         );
+    }
+
+    #[tokio::test]
+    async fn failed_stores_leave_no_temp_files() {
+        let f = fixture();
+        // A directory where the object should go makes the final rename fail.
+        let target = f._dir.path().join("orders/o1/p1.jpg");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let uri = path_and_query(&f.store.presign_put(&spec(1)).await.expect("presign").url);
+        assert_eq!(
+            send(&f, Method::PUT, &uri, Some("image/jpeg"), b"x")
+                .await
+                .0,
+            500
+        );
+        let names: Vec<String> = std::fs::read_dir(f._dir.path().join("orders/o1"))
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["p1.jpg"], "no *.tmp-* leftovers");
     }
 
     #[test]
