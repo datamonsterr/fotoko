@@ -10,4 +10,7 @@ pub mod fake_cups;
 pub mod fit;
 pub mod sim;
 
-pub use sim::{Fault, ParseFaultError, SimConfig, SimError, SimPrinter, SimState, decode};
+pub use sim::{
+    Fault, ImageInfo, ParseFaultError, SimConfig, SimError, SimPrinter, SimState, decode,
+    probe_file,
+};

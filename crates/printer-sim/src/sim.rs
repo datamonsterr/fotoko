@@ -194,6 +194,47 @@ pub fn decode(bytes: &[u8]) -> Result<DynamicImage, SimError> {
         .map_err(|e| SimError::InvalidImage(e.to_string()))
 }
 
+/// What the header of an image file says, without decoding the pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInfo {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// `image/jpeg` or `image/png`.
+    pub mime: &'static str,
+}
+
+/// Read an image file's format and size from its header. Rejects anything but JPEG and PNG and
+/// sizes the simulation would refuse to decode.
+pub fn probe_file(path: &Path) -> Result<ImageInfo, SimError> {
+    let reader = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .map_err(|e| SimError::io(path, e))?;
+    let mime = match reader.format() {
+        Some(ImageFormat::Jpeg) => "image/jpeg",
+        Some(ImageFormat::Png) => "image/png",
+        other => {
+            return Err(SimError::InvalidImage(format!(
+                "unsupported format {other:?}"
+            )));
+        }
+    };
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|e| SimError::InvalidImage(e.to_string()))?;
+    if width == 0 || height == 0 || width > MAX_EDGE_PX || height > MAX_EDGE_PX {
+        return Err(SimError::InvalidImage(format!(
+            "unsupported size {width}x{height}"
+        )));
+    }
+    Ok(ImageInfo {
+        width,
+        height,
+        mime,
+    })
+}
+
 impl SimPrinter {
     /// Create the printer and its output directory.
     pub fn new(config: SimConfig) -> Result<Self, SimError> {
@@ -507,6 +548,65 @@ mod tests {
         let path = printer.print_copy(&input, "job-9", 3).unwrap();
         assert_eq!(path, printer.out_dir().join("job-9-3.png"));
         assert_eq!(printer.state().paper_remaining, 4);
+    }
+
+    #[test]
+    fn probe_reports_format_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = write_image(dir.path(), "a.jpg", 30, 20, ImageFormat::Jpeg);
+        let png = write_image(dir.path(), "a.png", 20, 30, ImageFormat::Png);
+        assert_eq!(
+            probe_file(&jpg).unwrap(),
+            ImageInfo {
+                width: 30,
+                height: 20,
+                mime: "image/jpeg"
+            }
+        );
+        assert_eq!(
+            probe_file(&png).unwrap(),
+            ImageInfo {
+                width: 20,
+                height: 30,
+                mime: "image/png"
+            }
+        );
+    }
+
+    #[test]
+    fn probe_rejects_bad_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = dir.path().join("g.jpg");
+        fs::write(&garbage, b"nope nope nope").unwrap();
+        assert!(matches!(
+            probe_file(&garbage),
+            Err(SimError::InvalidImage(_))
+        ));
+        let gif = dir.path().join("a.gif");
+        fs::write(&gif, b"GIF89a\x01\x00\x01\x00\x00\x00\x00;").unwrap();
+        assert!(matches!(probe_file(&gif), Err(SimError::InvalidImage(_))));
+        assert!(matches!(
+            probe_file(&dir.path().join("none")),
+            Err(SimError::Io { .. })
+        ));
+        // PNG signature and header claiming a corrupt (zero-sized) image.
+        let png = write_image(dir.path(), "ok.png", 4, 4, ImageFormat::Png);
+        let mut bytes = fs::read(&png).unwrap();
+        bytes[16..24].fill(0); // width and height = 0
+        let zero = dir.path().join("zero.png");
+        fs::write(&zero, bytes).unwrap();
+        assert!(matches!(probe_file(&zero), Err(SimError::InvalidImage(_))));
+    }
+
+    #[test]
+    fn probe_rejects_huge_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_image(dir.path(), "ok.png", 4, 4, ImageFormat::Png);
+        let mut bytes = fs::read(&png).unwrap();
+        bytes[16..20].copy_from_slice(&(MAX_EDGE_PX + 1).to_be_bytes());
+        let huge = dir.path().join("huge.png");
+        fs::write(&huge, bytes).unwrap();
+        assert!(matches!(probe_file(&huge), Err(SimError::InvalidImage(_))));
     }
 
     #[test]

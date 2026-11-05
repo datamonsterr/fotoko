@@ -26,6 +26,7 @@ uuid = { version = "1.29.0", features = ["v4", "serde"] }
 # Workspace crates
 fotoko-protocol = { path = "crates/protocol" }
 fotoko-printer-sim = { path = "crates/printer-sim" }
+fotoko-pi-agent = { path = "crates/pi-agent" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
