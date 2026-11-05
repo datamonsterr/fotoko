@@ -129,12 +129,6 @@ pub fn sign_payment_request(
 /// numbers.
 fn webhook_fields(data: &PayosWebhookData) -> BTreeMap<String, Value> {
     let mut fields: BTreeMap<String, Value> = data.extra.clone().into_iter().collect();
-    // `code` and `desc` are typed fields, so they are not in `extra`: each key appears once.
-    for (key, value) in [("code", &data.code), ("desc", &data.desc)] {
-        if let Some(value) = value {
-            fields.insert(key.into(), Value::from(value.clone()));
-        }
-    }
     fields.insert("orderCode".into(), Value::from(data.order_code));
     fields.insert("amount".into(), Value::from(data.amount));
     fields
@@ -233,21 +227,41 @@ mod tests {
     }
 
     #[test]
-    fn typed_code_and_desc_are_signed_exactly_once() {
+    fn code_and_desc_are_signed_exactly_once() {
         let data = doc_webhook().data;
-        assert_eq!(data.code.as_deref(), Some("00"));
-        assert_eq!(data.desc.as_deref(), Some("Thành công"));
-        assert!(!data.extra.contains_key("code") && !data.extra.contains_key("desc"));
+        assert_eq!(data.code(), Some("00"));
         let text = signing_string(&webhook_fields(&data));
         assert_eq!(text.matches("&code=").count(), 1);
         assert_eq!(text.matches("&desc=").count(), 1);
-        // Changing either typed field breaks the signature.
+        // Changing either breaks the signature.
         let mut tampered = doc_webhook();
-        tampered.data.code = Some("01".into());
+        tampered.data.extra.insert("code".into(), json!("01"));
         assert!(!verify_webhook(DOC_KEY, &tampered));
         let mut tampered = doc_webhook();
-        tampered.data.desc = None;
+        tampered.data.extra.remove("desc");
         assert!(!verify_webhook(DOC_KEY, &tampered));
+    }
+
+    #[test]
+    fn null_desc_and_null_code_sign_as_empty_values() {
+        let webhook = webhook_with(json!({"desc": null, "code": null}), "");
+        assert_eq!(
+            signing_string(&webhook_fields(&webhook.data)),
+            "amount=20000&code=&desc=&description=Fotoko 1001&orderCode=1001"
+        );
+        for extra in [json!({"desc": null}), json!({"code": null})] {
+            let mut webhook = webhook_with(extra, "");
+            webhook.signature = sign_webhook_data("k", &webhook.data).expect("sign");
+            assert!(verify_webhook("k", &webhook));
+            // Dropping the null key changes the signing string.
+            let key = if webhook.data.extra.contains_key("desc") {
+                "desc"
+            } else {
+                "code"
+            };
+            webhook.data.extra.remove(key);
+            assert!(!verify_webhook("k", &webhook));
+        }
     }
 
     #[test]
@@ -343,8 +357,6 @@ mod tests {
         let data = PayosWebhookData {
             order_code: 9_007_199_254_740_993,
             amount: 1,
-            code: None,
-            desc: None,
             extra: BTreeMap::new(),
         };
         assert_eq!(
