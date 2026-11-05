@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# Provision a Fotoko Stand on a Raspberry Pi (Debian bookworm/trixie, aarch64). Run as root ON the Pi.
+# Idempotent: safe to re-run (also used for upgrades and cert rotation).
+#
+#   sudo ./install.sh --certs DIR --model gutenprint.5.3://canon-selphy-cp1300/expert \
+#        (--ssh-from CIDR | --skip-firewall) [options]
+#
+# DIR holds the provision-printer output: device.pem.crt private.pem.key AmazonRootCA1.pem agent.toml
+# Find a model string with:  lpinfo -m | grep -i gutenprint | grep -i <printer name>
+#
+# FOTOKO_ROOT=/some/dir prefixes every file path and skips the root check and chown (for tests).
+set -euo pipefail
+
+ROOT=${FOTOKO_ROOT:-}
+CONF_DIR="$ROOT/etc/fotoko"
+STATE_DIR="$ROOT/var/lib/fotoko"
+BIN_DST="$ROOT/usr/local/bin/fotoko-pi-agent"
+UNIT_DST="$ROOT/etc/systemd/system/fotoko-agent.service"
+CUPSD_CONF="$ROOT/etc/cups/cupsd.conf"
+AUTOUPG_CONF="$ROOT/etc/apt/apt.conf.d/20auto-upgrades"
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+BINARY="$here/fotoko-pi-agent"
+[ -f "$BINARY" ] || BINARY="$here/dist/fotoko-pi-agent"
+CERTS=""
+MODEL=""
+DEVICE_URI=""
+QUEUE=fotoko
+MEDIA=w288h432
+SSH_FROM=""
+DRY_RUN=0
+SKIP_PRINTER=0
+SKIP_FIREWALL=0
+DISABLE_BLUETOOTH=0
+DISABLE_AVAHI=0
+
+usage() {
+  cat <<'USAGE'
+Usage: install.sh --certs DIR [--model PPD_URI] (--ssh-from CIDR | --skip-firewall) [options]
+
+  --certs DIR          provision-printer output dir (required)
+  --model URI          Gutenprint driver for lpadmin -m (required unless --skip-printer)
+  --device-uri URI     CUPS device URI; default: the single usb:// printer found by lpinfo -v
+  --queue NAME         CUPS queue name (default fotoko; must match printer.queue in agent.toml)
+  --media NAME         default media (default w288h432 = 4x6 in; must match printer.media)
+  --binary PATH        agent binary (default ./fotoko-pi-agent or ./dist/fotoko-pi-agent)
+  --ssh-from CIDR      allow inbound ssh from this CIDR (e.g. 192.168.1.0/24); inbound is otherwise denied
+  --skip-firewall      do not touch the firewall
+  --skip-printer       do not create the CUPS queue (agent.toml may use backend = "sim")
+  --disable-bluetooth  disable bluetooth and hciuart services
+  --disable-avahi      disable avahi-daemon (the Pi is then not reachable as <host>.local)
+  --dry-run            print the actions, change nothing
+  -h, --help
+
+Over ssh (SSH_CONNECTION set) the firewall is only enabled with --ssh-from, so you cannot lock yourself out.
+USAGE
+}
+
+die() { echo "install.sh: $*" >&2; exit 1; }
+warn() { echo "install.sh: warning: $*" >&2; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --certs) CERTS=${2:?}; shift 2 ;;
+    --model) MODEL=${2:?}; shift 2 ;;
+    --device-uri) DEVICE_URI=${2:?}; shift 2 ;;
+    --queue) QUEUE=${2:?}; shift 2 ;;
+    --media) MEDIA=${2:?}; shift 2 ;;
+    --binary) BINARY=${2:?}; shift 2 ;;
+    --ssh-from) SSH_FROM=${2:?}; shift 2 ;;
+    --skip-firewall) SKIP_FIREWALL=1; shift ;;
+    --skip-printer) SKIP_PRINTER=1; shift ;;
+    --disable-bluetooth) DISABLE_BLUETOOTH=1; shift ;;
+    --disable-avahi) DISABLE_AVAHI=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$CERTS" ] || { usage >&2; die "--certs is required"; }
+[ "$SKIP_PRINTER" = 1 ] || [ -n "$MODEL" ] || die "--model is required (see: lpinfo -m | grep -i gutenprint), or pass --skip-printer"
+[ -f "$BINARY" ] || die "agent binary not found: $BINARY (run deploy/pi/build.sh, or pass --binary)"
+for f in device.pem.crt private.pem.key AmazonRootCA1.pem agent.toml; do
+  [ -f "$CERTS/$f" ] || die "missing $CERTS/$f"
+done
+if [ -n "$SSH_FROM" ]; then
+  [[ $SSH_FROM =~ ^[0-9a-fA-F:.]+(/[0-9]+)?$ ]] || die "--ssh-from must be a CIDR, got: $SSH_FROM"
+fi
+# ufw default-deny would cut the ssh session this script runs in.
+if [ "$SKIP_FIREWALL" = 0 ] && [ -z "$SSH_FROM" ] && [ -n "${SSH_CONNECTION:-}" ]; then
+  die "running over ssh: enabling the firewall without an ssh allow rule would lock you out. Pass --ssh-from CIDR (your admin network) or --skip-firewall."
+fi
+if [ "$DRY_RUN" = 0 ] && [ -z "$ROOT" ] && [ "$(id -u)" != 0 ]; then
+  die "must run as root (or use --dry-run)"
+fi
+
+# toml_value FILE KEY: value of a simple top-level 'key = "value"' line (empty when absent).
+toml_value() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1; }
+cfg_queue=$(toml_value "$CERTS/agent.toml" queue)
+cfg_media=$(toml_value "$CERTS/agent.toml" media)
+if [ "$SKIP_PRINTER" = 0 ]; then
+  [ -z "$cfg_queue" ] || [ "$cfg_queue" = "$QUEUE" ] || warn "--queue $QUEUE differs from printer.queue \"$cfg_queue\" in agent.toml; the agent would print to a queue that does not exist"
+  [ -z "$cfg_media" ] || [ "$cfg_media" = "$MEDIA" ] || warn "--media $MEDIA differs from printer.media \"$cfg_media\" in agent.toml"
+fi
+
+# run CMD...: print in dry-run mode, execute otherwise.
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "[dry-run] $*"
+  else
+    echo "+ $*"
+    "$@"
+  fi
+}
+# try CMD...: like run, but a failure only warns.
+try() { run "$@" || warn "failed: $*"; }
+step() { echo; echo "== $*"; }
+# own USER GROUP: install(1) ownership flags, omitted for non-dry-run test mode (FOTOKO_ROOT set).
+own() { if [ -z "$ROOT" ] || [ "$DRY_RUN" = 1 ]; then echo "-o $1 -g $2"; fi; }
+# inst MODE USER GROUP SRC DST
+inst() {
+  # shellcheck disable=SC2046 # own() output is meant to split
+  run install -m "$1" $(own "$2" "$3") "$4" "$5"
+}
+
+step "packages"
+# cups: scheduler; printer-driver-gutenprint: PPDs + rastertogutenprint (pulls cups-filters);
+# cups-client: lp, lpstat, cancel, lpadmin, lpinfo, lpoptions; ufw; unattended-upgrades.
+PKGS=(cups cups-client printer-driver-gutenprint unattended-upgrades)
+[ "$SKIP_FIREWALL" = 1 ] || PKGS+=(ufw)
+run env DEBIAN_FRONTEND=noninteractive apt-get update -y
+run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS[@]}"
+
+step "user and directories"
+if [ "$DRY_RUN" = 1 ] || ! id fotoko >/dev/null 2>&1; then
+  # No login, no extra groups: lp/cancel/lpstat work for any local user over the CUPS socket,
+  # and the agent must not be able to administer CUPS.
+  run useradd --system --user-group --home-dir /var/lib/fotoko --no-create-home --shell /usr/sbin/nologin fotoko
+else
+  echo "user fotoko exists"
+fi
+# shellcheck disable=SC2046
+run install -d -m 0750 $(own root fotoko) "$CONF_DIR"
+# shellcheck disable=SC2046
+run install -d -m 0750 $(own fotoko fotoko) "$STATE_DIR"
+
+step "binary"
+run install -d -m 0755 "$(dirname "$BIN_DST")"
+if [ -f "$BIN_DST" ] && ! cmp -s "$BINARY" "$BIN_DST"; then
+  # Keep the previous version for deploy.sh rollback.
+  run cp -p "$BIN_DST" "$BIN_DST.prev"
+fi
+inst 0755 root root "$BINARY" "$BIN_DST.new"
+run mv -f "$BIN_DST.new" "$BIN_DST"
+
+step "certificates and config"
+inst 0444 root fotoko "$CERTS/AmazonRootCA1.pem" "$CONF_DIR/AmazonRootCA1.pem"
+inst 0444 root fotoko "$CERTS/device.pem.crt" "$CONF_DIR/device.pem.crt"
+# The agent refuses a key with group/other bits; 0400 owned by the service user.
+inst 0400 fotoko fotoko "$CERTS/private.pem.key" "$CONF_DIR/private.pem.key"
+inst 0640 root fotoko "$CERTS/agent.toml" "$CONF_DIR/agent.toml"
+
+if [ "$SKIP_PRINTER" = 0 ]; then
+  step "cups"
+  run systemctl enable --now cups.service
+  # Local only: no remote admin, no sharing, no remote access.
+  run cupsctl --no-remote-admin --no-share-printers --no-remote-any
+  # The agent reads 'lpstat -W completed' to see how a job ended: job history is mandatory.
+  run cupsctl PreserveJobHistory=Yes
+  # Network printer discovery is unwanted on a kiosk.
+  try systemctl disable --now cups-browsed.service
+  if [ "$DRY_RUN" = 0 ] && [ -f "$CUPSD_CONF" ]; then
+    if grep -Eqi '^[[:space:]]*PreserveJobHistory[[:space:]]+(No|Off|False|0)' "$CUPSD_CONF"; then
+      die "PreserveJobHistory is still off in $CUPSD_CONF; the agent cannot read job results"
+    fi
+    # Expect Listen localhost:631 and the unix socket only.
+    if grep -Ei '^[[:space:]]*(Listen|Port|SSLListen|SSLPort)[[:space:]]' "$CUPSD_CONF" \
+      | grep -Eviq '^[[:space:]]*Listen[[:space:]]+(localhost:631|127\.0\.0\.1:631|\[::1\]:631|/run/cups/cups\.sock|/var/run/cups/cups\.sock)[[:space:]]*$'; then
+      warn "$CUPSD_CONF has a Listen/Port directive other than localhost:631; CUPS may be reachable from the network"
+    elif ! grep -Eqi '^[[:space:]]*Listen[[:space:]]+(localhost:631|127\.0\.0\.1:631)' "$CUPSD_CONF"; then
+      warn "$CUPSD_CONF has no explicit 'Listen localhost:631'; check 'ss -ltn | grep 631' shows loopback only"
+    fi
+  fi
+  if [ -z "$DEVICE_URI" ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      DEVICE_URI="<usb:// URI autodetected by lpinfo -v>"
+    else
+      mapfile -t uris < <(lpinfo -v | awk '$1 == "direct" && $2 ~ /^usb:/ { print $2 }')
+      [ "${#uris[@]}" -eq 1 ] || die "expected exactly one USB printer, found ${#uris[@]}; pass --device-uri (see: lpinfo -v)"
+      DEVICE_URI=${uris[0]}
+    fi
+  fi
+  # printer-error-policy=stop-printer: on a paper/ribbon/cover error CUPS stops the queue and keeps
+  # the job; the agent sees the stopped queue (lpstat -p), cancels the failed job and reports
+  # paper_out/ribbon_out, so the order fails instead of silently vanishing. abort-job would drop
+  # the print and leave the queue looking healthy. After fixing, run 'cupsenable <queue>'.
+  run lpadmin -p "$QUEUE" -E -v "$DEVICE_URI" -m "$MODEL" \
+    -o "media=$MEDIA" -o printer-error-policy=stop-printer -o printer-is-shared=false
+  run cupsenable "$QUEUE"
+  run cupsaccept "$QUEUE"
+  run lpadmin -d "$QUEUE"
+  if [ "$DRY_RUN" = 0 ]; then
+    if ! lpoptions -p "$QUEUE" -l | grep -qF "$MEDIA"; then
+      warn "media '$MEDIA' not listed by 'lpoptions -p $QUEUE -l'; pick a PageSize/media name the driver offers and set printer.media in agent.toml"
+    fi
+  fi
+fi
+
+if [ "$SKIP_FIREWALL" = 0 ]; then
+  step "firewall (ufw)"
+  run ufw default deny incoming
+  run ufw default allow outgoing
+  if [ -n "$SSH_FROM" ]; then
+    run ufw allow from "$SSH_FROM" to any port 22 proto tcp
+  else
+    echo "no --ssh-from: no inbound ssh will be allowed (console access only)"
+  fi
+  run ufw --force enable
+fi
+
+step "unattended upgrades"
+if [ "$DRY_RUN" = 1 ]; then
+  echo "[dry-run] write $AUTOUPG_CONF (Update-Package-Lists 1, Unattended-Upgrade 1)"
+else
+  mkdir -p "$(dirname "$AUTOUPG_CONF")"
+  printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' > "$AUTOUPG_CONF"
+fi
+run systemctl enable --now unattended-upgrades.service
+step "time sync (TLS needs a correct clock)"
+try systemctl enable --now systemd-timesyncd.service
+
+if [ "$DISABLE_BLUETOOTH" = 1 ]; then
+  step "disable bluetooth"
+  try systemctl disable --now bluetooth.service hciuart.service
+fi
+if [ "$DISABLE_AVAHI" = 1 ]; then
+  step "disable avahi"
+  try systemctl disable --now avahi-daemon.service avahi-daemon.socket
+fi
+
+step "systemd unit"
+run install -d -m 0755 "$(dirname "$UNIT_DST")"
+inst 0644 root root "$here/fotoko-agent.service" "$UNIT_DST"
+run systemctl daemon-reload
+run systemctl enable fotoko-agent.service
+run systemctl restart fotoko-agent.service
+echo
+echo "done. check: systemctl is-active fotoko-agent; journalctl -u fotoko-agent -n 50"
