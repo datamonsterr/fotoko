@@ -1,0 +1,53 @@
+[Unit]
+Description=Fotoko Pi print agent
+After=network-online.target cups.service time-sync.target
+Wants=network-online.target cups.service time-sync.target
+# Never give up restarting: a Stand must come back after an outage.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=fotoko
+Group=fotoko
+# The agent reads USER as the CUPS job owner (lpstat -o filter).
+Environment=USER=fotoko
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/fotoko-pi-agent --config /etc/fotoko/agent.toml
+Restart=always
+RestartSec=5
+# shutdown_grace_secs defaults to 20; keep this above grace + 10.
+TimeoutStopSec=45
+UMask=0077
+MemoryMax=256M
+TasksMax=64
+
+# Hardening
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadWritePaths=/var/lib/fotoko
+
+[Install]
+WantedBy=multi-user.target
