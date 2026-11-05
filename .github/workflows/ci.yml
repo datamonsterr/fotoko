@@ -240,6 +240,25 @@ jobs:
           JUNIT: target/nextest/ci/junit.xml
         run: bash scripts/ci/summary.sh rust-e2e "bash scripts/ci/repro.sh rust-e2e" "cargo nextest run -p fotoko-e2e --all-features --profile ci"
 
+  arch:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: arch
+      - run: bash scripts/ci/repro.sh arch
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh arch "bash scripts/ci/repro.sh arch" "crate dependency rules (scripts/ci/check_arch.py, AGENTS.md Architecture rules)"
+
   deny:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -459,6 +478,7 @@ jobs:
       - rust-test
       - rust-integration
       - rust-e2e
+      - arch
       - deny
       - pi-cross-build
       - lambda-build

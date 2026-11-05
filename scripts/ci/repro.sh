@@ -5,7 +5,7 @@
 #   bash scripts/ci/repro.sh <job> [arg]
 #   bash scripts/ci/repro.sh list
 #
-# Jobs: rust-lint, rust-test [crate], rust-integration, rust-e2e, deny, js [mobile|infra],
+# Jobs: rust-lint, rust-test [crate], rust-integration, rust-e2e, arch, deny, js [mobile|infra],
 #       format, cdk-synth, web-e2e, pi-cross-build, lambda-build, shellcheck, actionlint
 # Env: CI=1 switches to concise output (clippy --message-format short).
 set -euo pipefail
@@ -108,6 +108,10 @@ job_rust_e2e() {
     fi
 }
 
+job_arch() {
+    bash scripts/ci/check-arch.sh
+}
+
 job_deny() {
     need cargo-deny "Install it with: cargo install cargo-deny --locked"
     cargo deny --all-features check
@@ -179,7 +183,7 @@ case "$JOB" in
 list)
     sed -n 's/^# Jobs: //p; s/^#       //p' "${BASH_SOURCE[0]}" | head -2
     ;;
-rust-lint | rust-test | rust-integration | rust-e2e | deny | js | format | cdk-synth | web-e2e | pi-cross-build | lambda-build | shellcheck | actionlint)
+rust-lint | rust-test | rust-integration | rust-e2e | arch | deny | js | format | cdk-synth | web-e2e | pi-cross-build | lambda-build | shellcheck | actionlint)
     log "$JOB ${*:-}"
     "job_${JOB//-/_}" "$@"
     log "$JOB ok"
