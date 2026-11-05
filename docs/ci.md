@@ -30,8 +30,8 @@ Areas a PR touches (`changes`): `rust` is `crates/**`; `mobile` is `apps/mobile/
 ## Adding crates, packages and jobs
 
 - **New crate** under `crates/*`: it joins `rust-lint`, `rust-test`, `deny` automatically. A crate that needs its own job (like `fotoko-e2e`) goes into `OWN_JOB` in `scripts/ci/cargo_meta.py`.
-- **`crates/api`** (T6) and its non-default feature `local`: tests run with `--all-features`; the Lambda build uses `--no-default-features` and the bins from `cargo_meta.py lambda-bins` (bins with `required-features`, such as `fotoko-local`, are skipped).
-- **`crates/e2e`, `packages/e2e-web`, `docker-compose.test.yml`**: `changes` checks for them. While they are missing their jobs are skipped and a notice explains why; once the files exist the jobs run, with no workflow edit. `web-e2e` runs `pnpm --filter ./packages/e2e-web run test:e2e`, so the package's script must start whatever the test needs.
+- **`crates/api`** and its non-default feature `local`: tests run with `--all-features`; the Lambda build uses `--no-default-features` and the bins from `cargo_meta.py lambda-bins` (bins with `required-features`, such as `fotoko-local`, are skipped).
+- **`crates/e2e`, `packages/e2e-web`, `docker-compose.test.yml`**: `changes` checks for them. They exist today; the existence guards stay so forks or partial checkouts without them skip those jobs with a notice instead of failing. `web-e2e` runs `pnpm --filter ./packages/e2e-web run test:e2e`, so the package's script must start whatever the test needs.
 - **New JS package**: add it to the `changes` filters and to the default list in `job_js` in `scripts/ci/repro.sh`.
 - **New job**: add a `job_<name>` function to `repro.sh`, call it from the job, and add it to `ci-ok.needs`.
 

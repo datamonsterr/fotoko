@@ -1,5 +1,7 @@
 # Plan 0001: initial setup and vertical slice
 
+> Historical: executed 2026-11-05. Absolute paths below refer to the machine the plan ran on. Deviations and later decisions are recorded in ADRs 0002–0004.
+
 Goal: monorepo where a Stand user can scan QR -> upload -> pay (payOS) -> print, fully runnable in simulation, with unit/integration/e2e tests, AWS CDK infra, Pi deployment scripts, agent tooling and fast CI. Read `docs/contracts.md` and `docs/adr/0001-architecture.md`. Terms: `CONTEXT.md`.
 
 Global rules for every task:

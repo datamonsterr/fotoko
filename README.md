@@ -33,7 +33,7 @@ Optional tools: `cargo-nextest`, `cargo-deny`, `shellcheck`.
 
 ## Layout
 
-`crates/*` Rust workspace (`protocol` today), `apps/*` Expo app, `packages/*` shared JS, `infra/*` CDK, `deploy/pi` Pi provisioning, `scripts/ci` check scripts.
+See the layout table in [AGENTS.md](AGENTS.md#layout) and [docs/contracts.md](docs/contracts.md#repository-layout).
 
 ## Run the whole stack locally
 

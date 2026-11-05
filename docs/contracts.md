@@ -24,7 +24,7 @@ Root `Cargo.toml` workspace members: `["crates/*"]`. `pnpm-workspace.yaml`: `app
 
 Auth: API Gateway IAM auth with Cognito identity pool guest credentials (SigV4). Handler reads the Cognito identity id from the request context. Local/sim mode only (`FOTOKO_MODE=local`): identity from header `x-fotoko-identity`. Public routes: `GET /v1/printers/{id}`, webhook, `GET /healthz`.
 
-Errors: `{"error":{"code":"<snake_case>","message":"..."}}`. Codes: `not_found`, `validation`, `forbidden`, `conflict`, `payment_provider`, `internal`.
+Errors: `{"error":{"code":"<snake_case>","message":"..."}}`. Codes and HTTP status: `validation` 400, `forbidden` 403, `not_found` 404, `conflict` 409, `payment_provider` 502, `internal` 500 (message is generic; cause only in logs). Wrong method -> 405 `validation`; body over 64 KiB -> 413 `validation`. Clients must tolerate unknown codes.
 
 | Method + path                        | Request                                                                            | Response                                                                                                               |
 | ------------------------------------ | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
@@ -61,7 +61,7 @@ Check current docs before coding (payos.vn docs, `payOSHQ` SDKs). Expected:
 - Webhook: `{code, desc, success, data:{orderCode, amount, ...}, signature}`; `signature = HMAC_SHA256(checksumKey, data keys sorted alphabetically joined as k=v&...)`. The paid decision uses the signed `data.code == "00"` (the outer `code` is unsigned and only cross-checked). Null values sign as empty strings. Amount must equal order amount.
 - `returnUrl`/`cancelUrl`: `{PUBLIC_APP_URL}/orders/{orderId}`.
 
-## MQTT (AWS IoT Core; local: embedded `rumqttd` or mosquitto)
+## MQTT (AWS IoT Core; local: embedded `rumqttd` via `fotoko-sim-broker`)
 
 Thing name = `printerId`. QoS 1. JSON, camelCase.
 
@@ -74,7 +74,7 @@ Thing name = `printerId`. QoS 1. JSON, camelCase.
 Pi error codes: `paper_out`, `ribbon_out`, `printer_offline`, `download_failed`, `invalid_image`, `driver_error`.
 Pi rules: reject jobs whose `printerId` != own id; dedupe by `jobId` (persisted file); download only `https` URLs (allow `http` when `allow_insecure_http = true` for sim); max 15 MiB per image; validate magic bytes match `contentType`.
 
-Status mapping (cloud): `received|printing` -> order `printing`; `completed` -> `completed`; `failed` -> `failed`. Heartbeat updates printer `status` + `lastSeenAt`.
+Status mapping (cloud): `received|printing` -> order `printing`; `completed` -> `completed`; `failed` -> `failed`. Heartbeat updates printer `status` + `lastSeenAt` (server time): `idle` -> `online`, `printing` -> `busy`, `error` -> `error`, `offline` -> `offline`. Orders are accepted for `online` and `busy` printers (ADR 0002).
 
 ## DynamoDB (single table, `TABLE_NAME`)
 
@@ -98,6 +98,8 @@ S3 (`BUCKET_NAME`): `orders/{orderId}/{photoId}.{jpg|png}`. Lifecycle: delete af
 | `fotoko-local`      | local dev / e2e server, cargo feature `local` (not deployed)                                                              | cargo bin                                   |
 
 Built with `cargo lambda build --release --arm64`. CDK reads `FOTOKO_LAMBDA_DIR` (default `<repo>/target/lambda`).
+
+Local server (`fotoko-local`, feature `local`): `FOTOKO_LOCAL_ADDR`, `FOTOKO_LOCAL_PUBLIC_URL`, `FOTOKO_LOCAL_DIR`, `FOTOKO_LOCAL_SECRET`, `FOTOKO_LOCAL_PRINTERS`, `FOTOKO_MQTT_URL`; see `.env.example` and `crates/api/README.md`.
 
 Env: `FOTOKO_MODE` (`aws`\|`local`), `TABLE_NAME`, `BUCKET_NAME`, `IOT_DATA_ENDPOINT`, `PAYOS_BASE_URL` (default `https://api-merchant.payos.vn`), `PAYOS_SECRET_ARN` (Secrets Manager JSON `{clientId,apiKey,checksumKey}`) or `PAYOS_CLIENT_ID`/`PAYOS_API_KEY`/`PAYOS_CHECKSUM_KEY` in local, `PUBLIC_APP_URL`, `DEFAULT_PRICE_VND` (10000).
 
