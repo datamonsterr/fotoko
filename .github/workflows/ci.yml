@@ -1,0 +1,487 @@
+name: CI
+
+# Single required check: ci-ok. Every job runs `bash scripts/ci/repro.sh <job>`, the same
+# commands an agent runs locally; failed jobs print that command in their summary.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  RUST_BACKTRACE: short
+
+jobs:
+  # Decide which areas a pull request touches. Pushes to main and manual runs check everything,
+  # and so does a change to root config (toolchains, lockfiles, CI itself).
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.resolve.outputs.rust }}
+      mobile: ${{ steps.resolve.outputs.mobile }}
+      infra: ${{ steps.resolve.outputs.infra }}
+      e2e: ${{ steps.resolve.outputs.e2e }}
+      shell: ${{ steps.resolve.outputs.shell }}
+      workflows: ${{ steps.resolve.outputs.workflows }}
+      js_pkgs: ${{ steps.resolve.outputs.js_pkgs }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_api: ${{ steps.resolve.outputs.has_api }}
+      has_compose: ${{ steps.resolve.outputs.has_compose }}
+      has_e2e_crate: ${{ steps.resolve.outputs.has_e2e_crate }}
+      has_e2e_web: ${{ steps.resolve.outputs.has_e2e_web }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            root:
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+              - 'scripts/ci/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - '.nvmrc'
+              - '.prettier*'
+              - '.editorconfig'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - 'clippy.toml'
+              - 'deny.toml'
+              - '.config/**'
+              - '.cargo/**'
+            rust:
+              - 'crates/**'
+              - 'docker-compose.test.yml'
+            mobile:
+              - 'apps/mobile/**'
+              - 'packages/**'
+            infra:
+              - 'infra/**'
+              - 'apps/mobile/**'
+              - 'scripts/deploy/**'
+            e2e:
+              - 'crates/**'
+              - 'apps/mobile/**'
+              - 'packages/e2e-web/**'
+              - 'scripts/e2e/**'
+              - 'docker-compose*.yml'
+            shell:
+              - '**/*.sh'
+              - 'deploy/**'
+            workflows:
+              - '.github/**'
+      - name: Resolve areas and optional components
+        id: resolve
+        env:
+          FILTER: ${{ toJSON(steps.filter.outputs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          flag() { # flag <area>: true when everything runs or the area changed
+            if [ "$EVENT" != pull_request ] || [ "$(jq -r '.root // "false"' <<<"$FILTER")" = true ]; then
+              echo true
+            else
+              jq -r --arg k "$1" '.[$k] // "false"' <<<"$FILTER"
+            fi
+          }
+          exists() { [ -e "$1" ] && echo true || echo false; }
+
+          rust=$(flag rust); mobile=$(flag mobile); infra=$(flag infra)
+          e2e=$(flag e2e); shell=$(flag shell); workflows=$(flag workflows)
+          has_api=$(exists crates/api/Cargo.toml)
+          has_compose=$(exists docker-compose.test.yml)
+          has_e2e_crate=$(exists crates/e2e/Cargo.toml)
+          has_e2e_web=$(exists packages/e2e-web/package.json)
+
+          pkgs=()
+          [ "$mobile" = true ] && pkgs+=(mobile)
+          [ "$infra" = true ] && pkgs+=(infra)
+          js_pkgs=$(printf '%s\n' "${pkgs[@]}" | jq -R . | jq -sc 'map(select(. != ""))')
+
+          {
+            echo "rust=$rust"; echo "mobile=$mobile"; echo "infra=$infra"
+            echo "e2e=$e2e"; echo "shell=$shell"; echo "workflows=$workflows"
+            echo "js_pkgs=$js_pkgs"
+            echo "has_api=$has_api"; echo "has_compose=$has_compose"
+            echo "has_e2e_crate=$has_e2e_crate"; echo "has_e2e_web=$has_e2e_web"
+          } >> "$GITHUB_OUTPUT"
+
+          [ "$rust" = true ] && [ "$has_api" = false ] && echo "::notice title=lambda-build, rust-integration skipped::crates/api does not exist yet"
+          [ "$rust" = true ] && [ "$has_api" = true ] && [ "$has_compose" = false ] && echo "::notice title=rust-integration skipped::docker-compose.test.yml does not exist yet"
+          [ "$e2e" = true ] && [ "$has_e2e_crate" = false ] && echo "::notice title=rust-e2e skipped::crates/e2e does not exist yet"
+          [ "$e2e" = true ] && [ "$has_e2e_web" = false ] && echo "::notice title=web-e2e skipped::packages/e2e-web does not exist yet"
+          {
+            echo "### Changed areas"
+            echo
+            echo "rust=$rust mobile=$mobile infra=$infra e2e=$e2e shell=$shell workflows=$workflows"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # The rust-test matrix comes from `cargo metadata`, so new crates join without editing CI.
+      # Plain cargo (preinstalled stable, no toolchain install or cache): metadata does not compile.
+      - id: matrix
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: echo "matrix=$(python3 -I scripts/ci/cargo_meta.py test-matrix)" >> "$GITHUB_OUTPUT"
+
+  # ---------- Rust ----------
+
+  rust-lint:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: lint
+      - run: bash scripts/ci/repro.sh rust-lint
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh rust-lint "bash scripts/ci/repro.sh rust-lint" "cargo fmt --all --check" "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+  rust-test:
+    name: rust-test (${{ matrix.crate }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    env:
+      CRATE: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # One cache per crate: `-p` builds unify features differently, and PR runs only restore.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test-${{ matrix.crate }}
+          nextest: 'true'
+      - run: bash scripts/ci/repro.sh rust-test "$CRATE"
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          JUNIT: target/nextest/ci/junit.xml
+        run: bash scripts/ci/summary.sh "rust-test ${CRATE}" "bash scripts/ci/repro.sh rust-test ${CRATE}" "cargo nextest run -p ${CRATE} --all-features --profile ci" "cargo test -p ${CRATE} --all-features --doc"
+
+  rust-integration:
+    needs: changes
+    if: >-
+      needs.changes.outputs.rust == 'true' &&
+      needs.changes.outputs.has_api == 'true' &&
+      needs.changes.outputs.has_compose == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test-fotoko-api
+          nextest: 'true'
+      # DynamoDB Local and MinIO from docker-compose.test.yml; repro.sh brings them up and down.
+      - run: bash scripts/ci/repro.sh rust-integration
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          JUNIT: target/nextest/ci/junit.xml
+        run: bash scripts/ci/summary.sh rust-integration "docker compose -f docker-compose.test.yml up -d --wait && bash scripts/ci/repro.sh rust-integration" "FOTOKO_IT=1 cargo nextest run -p fotoko-api --run-ignored all"
+
+  rust-e2e:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true' && needs.changes.outputs.has_e2e_crate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: e2e
+          nextest: 'true'
+      - run: bash scripts/ci/repro.sh rust-e2e
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          JUNIT: target/nextest/ci/junit.xml
+        run: bash scripts/ci/summary.sh rust-e2e "bash scripts/ci/repro.sh rust-e2e" "cargo nextest run -p fotoko-e2e --all-features --profile ci"
+
+  deny:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh deny "bash scripts/ci/repro.sh deny" "cargo deny --all-features check (advisories, licenses, bans, sources)"
+
+  pi-cross-build:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # ring and aws-lc compile C: the aarch64 target needs a C cross compiler and linker.
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: pi-aarch64
+      - run: bash scripts/ci/repro.sh pi-cross-build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fotoko-pi-agent-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/fotoko-pi-agent
+          if-no-files-found: error
+          retention-days: 3
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh pi-cross-build "bash scripts/ci/repro.sh pi-cross-build" "cargo build --release -p fotoko-pi-agent --target aarch64-unknown-linux-gnu"
+
+  lambda-build:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.has_api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: lambda
+      # cargo-lambda cross-compiles with Zig, which the PyPI package bundles.
+      - name: Install cargo-lambda
+        run: pipx install cargo-lambda==1.9.2
+      - run: bash scripts/ci/repro.sh lambda-build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fotoko-lambdas-arm64
+          path: target/lambda
+          if-no-files-found: error
+          retention-days: 3
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh lambda-build "bash scripts/ci/repro.sh lambda-build" "cargo lambda build --release --arm64 -p fotoko-api --no-default-features"
+
+  # ---------- JavaScript ----------
+
+  js:
+    name: js (${{ matrix.pkg }})
+    needs: changes
+    if: needs.changes.outputs.js_pkgs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: ${{ fromJSON(needs.changes.outputs.js_pkgs) }}
+    env:
+      PKG: ${{ matrix.pkg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-js
+      - run: bash scripts/ci/repro.sh js "$PKG"
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh "js ${PKG}" "bash scripts/ci/repro.sh js ${PKG}" "pnpm exec turbo run lint typecheck test --filter=@fotoko/${PKG}"
+
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-js
+      - run: bash scripts/ci/repro.sh format
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh format "bash scripts/ci/repro.sh format" "pnpm format:check (fix with pnpm format)"
+
+  cdk-synth:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-js
+      - run: bash scripts/ci/repro.sh cdk-synth
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh cdk-synth "bash scripts/ci/repro.sh cdk-synth" "FOTOKO_LAMBDA_DIR=infra/cdk/test/fixtures/lambda cdk synth"
+
+  web-e2e:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true' && needs.changes.outputs.has_e2e_web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The stack under test (fotoko-local, pi-agent sim, payOS mock) builds from source.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: web-e2e
+      - uses: ./.github/actions/setup-js
+      - run: bash scripts/ci/repro.sh web-e2e
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            packages/e2e-web/playwright-report
+            packages/e2e-web/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh web-e2e "bash scripts/ci/repro.sh web-e2e" "pnpm --filter ./packages/e2e-web run test:e2e (report in the playwright-report artifact on failure)"
+
+  # ---------- Repository hygiene ----------
+
+  shellcheck:
+    needs: changes
+    if: needs.changes.outputs.shell == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash scripts/ci/repro.sh shellcheck
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh shellcheck "bash scripts/ci/repro.sh shellcheck" "shellcheck -x on every tracked *.sh"
+
+  actionlint:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The release tarball is verified; actionlint also shellchecks the `run:` scripts.
+      - name: Install actionlint
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/actionlint.tgz" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP/bin" actionlint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/ci/repro.sh actionlint
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh actionlint "bash scripts/ci/repro.sh actionlint" "actionlint ${ACTIONLINT_VERSION}"
+
+  # The one required check: every needed job passed or was skipped.
+  ci-ok:
+    if: always()
+    needs:
+      - changes
+      - rust-lint
+      - rust-test
+      - rust-integration
+      - rust-e2e
+      - deny
+      - pi-cross-build
+      - lambda-build
+      - js
+      - format
+      - cdk-synth
+      - web-e2e
+      - shellcheck
+      - actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every job to pass or be skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r '
+            "### ci-ok", "",
+            "| job | result | reproduce locally |", "| --- | --- | --- |",
+            (to_entries[] | "| \(.key) | \(.value.result) | " +
+              (if (.value.result == "failure" or .value.result == "cancelled") and (.key != "changes")
+               then "`bash scripts/ci/repro.sh \(.key)`" else "" end) + " |")
+          ' <<<"$NEEDS" >> "$GITHUB_STEP_SUMMARY"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" > /dev/null
