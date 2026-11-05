@@ -1,0 +1,39 @@
+[package]
+name = "fotoko-e2e"
+description = "Simulation e2e: the whole flow (API, MQTT broker, payOS mock, Pi agent, printer sim) in one process, plus the binaries the Playwright run and docker compose use."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "fotoko-sim-broker"
+path = "src/bin/fotoko-sim-broker.rs"
+
+[[bin]]
+name = "fotoko-payos-mock"
+path = "src/bin/fotoko-payos-mock.rs"
+
+[dependencies]
+fotoko-api = { workspace = true, features = ["local"] }
+fotoko-core = { workspace = true, features = ["testing"] }
+fotoko-pi-agent.workspace = true
+fotoko-printer-sim.workspace = true
+fotoko-protocol.workspace = true
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
+chrono = { workspace = true, features = ["clock"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "form"] }
+rumqttc = { version = "0.25.1", default-features = false }
+rumqttd = { version = "=0.20.0", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wiremock = "=0.6.5"
+
+[lints]
+workspace = true
