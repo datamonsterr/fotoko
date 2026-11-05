@@ -229,7 +229,7 @@ impl OrderService {
             .ok_or_else(|| {
                 CoreError::NotFound(format!("printer {} not found", request.printer_id))
             })?;
-        printer.require_online()?;
+        printer.require_bookable()?;
         let amount_vnd = domain::price(&request.photos, printer.price_per_print_vnd)?;
 
         let now = self.ports.clock.now();
