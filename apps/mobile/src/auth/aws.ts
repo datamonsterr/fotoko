@@ -63,20 +63,32 @@ export function createAwsAuth(options: AwsAuthOptions): Authenticator {
   const now = options.now ?? serverClock.now;
   let cached: AwsCredentials | undefined;
   let inflight: Promise<AwsCredentials> | undefined;
+  // Bumped by invalidate(): a fetch started before it must not repopulate the cache.
+  let generation = 0;
 
-  async function credentials(): Promise<AwsCredentials> {
-    if (cached && cached.expiresAt - now() > REFRESH_SKEW_MS) return cached;
-    inflight ??= options
+  function credentials(): Promise<AwsCredentials> {
+    if (cached && cached.expiresAt - now() > REFRESH_SKEW_MS) {
+      return Promise.resolve(cached);
+    }
+    if (inflight) return inflight;
+    const gen = generation;
+    const request: Promise<AwsCredentials> = options
       .getCredentials()
-      .then((c) => (cached = c))
+      .then((c) => {
+        if (gen === generation) cached = c;
+        return c;
+      })
       .finally(() => {
-        inflight = undefined;
+        // Only clear our own slot: a newer fetch may have replaced it.
+        if (inflight === request) inflight = undefined;
       });
-    return inflight;
+    inflight = request;
+    return request;
   }
 
   return {
     invalidate() {
+      generation++;
       cached = undefined;
       inflight = undefined;
     },

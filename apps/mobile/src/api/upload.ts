@@ -39,6 +39,8 @@ export async function putPhoto(
       e instanceof Error ? e.message : 'cannot read photo',
     );
   });
+  // The read can take a while; abort may have fired meanwhile.
+  if (args.signal?.aborted) throw new ApiError('aborted', 'upload aborted');
   const xhr = deps.createXhr ? deps.createXhr() : new XMLHttpRequest();
   await new Promise<void>((resolve, reject) => {
     const onAbort = () => xhr.abort();

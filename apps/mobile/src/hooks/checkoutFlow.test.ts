@@ -28,6 +28,7 @@ function setup(
     upload?: (a: UploadArgs) => Promise<void>;
     createOrder?: jest.Mock;
     checkout?: jest.Mock;
+    cancelOrder?: jest.Mock;
     onCheckout?: jest.Mock;
     now?: () => number;
   } = {},
@@ -36,16 +37,26 @@ function setup(
     overrides.createOrder ?? jest.fn().mockResolvedValue(createdOrder(n));
   const checkout =
     overrides.checkout ?? jest.fn().mockResolvedValue(checkoutRes);
+  const cancelOrder = overrides.cancelOrder ?? jest.fn().mockResolvedValue({});
   const upload = jest.fn(overrides.upload ?? (async () => {}));
   const onCheckout = overrides.onCheckout ?? jest.fn();
   const flow = new CheckoutFlow('stand-001', draft(n), {
-    client: () => ({ createOrder, checkout }) as unknown as ApiClient,
+    client: () =>
+      ({ createOrder, checkout, cancelOrder }) as unknown as ApiClient,
     upload,
     onCheckout,
     now: overrides.now,
   });
   const settle = () => new Promise<void>((r) => setTimeout(r, 0));
-  return { flow, createOrder, checkout, upload, onCheckout, settle };
+  return {
+    flow,
+    createOrder,
+    checkout,
+    cancelOrder,
+    upload,
+    onCheckout,
+    settle,
+  };
 }
 
 describe('CheckoutFlow happy path', () => {
@@ -576,5 +587,139 @@ describe('CheckoutFlow expiry and restart', () => {
     flow.restart();
     await settle();
     expect(flow.getState().phase).toBe('redirected');
+  });
+});
+
+describe('CheckoutFlow abandoned orders', () => {
+  it('a real unmount after the order was created (no checkout) cancels it, best effort', async () => {
+    const cancelOrder = jest
+      .fn()
+      .mockRejectedValue(new ApiError('conflict', 'x'));
+    const { flow, settle } = setup(1, {
+      cancelOrder,
+      upload: () => new Promise(() => {}),
+    });
+    flow.start();
+    await settle();
+    flow.dispose();
+    await settle();
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(cancelOrder).toHaveBeenCalledWith('ord-1');
+    await settle();
+    expect(cancelOrder).toHaveBeenCalledTimes(1); // once
+  });
+
+  it('StrictMode dispose + arm in the same tick does not cancel', async () => {
+    const { flow, cancelOrder, settle } = setup(1, {
+      upload: () => new Promise(() => {}),
+    });
+    flow.start();
+    await settle();
+    flow.dispose();
+    flow.arm();
+    await settle();
+    await settle();
+    expect(cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel once checkout succeeded (the user is paying)', async () => {
+    const { flow, cancelOrder, onCheckout, settle } = setup(1);
+    flow.start();
+    await settle();
+    expect(onCheckout).toHaveBeenCalled();
+    flow.dispose();
+    await settle();
+    expect(cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('dispose while the create is still in flight cancels the order once it lands', async () => {
+    let created: (v: ReturnType<typeof createdOrder>) => void = () => {};
+    const createOrder = jest.fn(
+      () => new Promise<ReturnType<typeof createdOrder>>((r) => (created = r)),
+    );
+    const { flow, cancelOrder, upload, settle } = setup(1, { createOrder });
+    flow.start();
+    await settle();
+    flow.dispose();
+    await settle();
+    expect(cancelOrder).not.toHaveBeenCalled();
+    created(createdOrder(1));
+    await settle();
+    expect(cancelOrder).toHaveBeenCalledWith('ord-1');
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('nothing to cancel when no order was ever requested, or the create failed', async () => {
+    const idle = setup(1);
+    idle.flow.dispose();
+    await idle.settle();
+    expect(idle.cancelOrder).not.toHaveBeenCalled();
+
+    const createOrder = jest
+      .fn()
+      .mockRejectedValue(new ApiError('network', 'x'));
+    const failed = setup(1, { createOrder });
+    failed.flow.start();
+    await failed.settle();
+    failed.flow.dispose();
+    await failed.settle();
+    expect(failed.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('after an abandon-cancel, re-arming starts a fresh order', async () => {
+    const createOrder = jest
+      .fn()
+      .mockResolvedValueOnce(createdOrder(1))
+      .mockResolvedValueOnce({ ...createdOrder(1), orderId: 'ord-2' });
+    const { flow, cancelOrder, onCheckout, settle } = setup(1, {
+      createOrder,
+      upload: () => new Promise(() => {}),
+    });
+    flow.start();
+    await settle();
+    flow.dispose();
+    await settle();
+    expect(cancelOrder).toHaveBeenCalledWith('ord-1');
+    flow.arm();
+    flow.setDeps({
+      client: () =>
+        ({
+          createOrder,
+          checkout: jest
+            .fn()
+            .mockResolvedValue({ ...checkoutRes, orderId: 'ord-2' }),
+          cancelOrder,
+        }) as unknown as ApiClient,
+      upload: async () => {},
+      onCheckout,
+    });
+    flow.start();
+    await settle();
+    expect(createOrder).toHaveBeenCalledTimes(2);
+    expect(onCheckout).toHaveBeenCalledWith('https://pay.example/c', 'ord-2');
+  });
+
+  it('restart after a checkout resets the checked-out flag so a later unmount cancels', async () => {
+    const createOrder = jest
+      .fn()
+      .mockResolvedValueOnce({
+        ...createdOrder(1),
+        uploads: [
+          { ...createdOrder(1).uploads[0], expiresAt: '2000-01-01T00:00:00Z' },
+        ],
+      })
+      .mockResolvedValueOnce({ ...createdOrder(1), orderId: 'ord-2' });
+    const { flow, cancelOrder, settle } = setup(1, {
+      createOrder,
+      upload: () => new Promise(() => {}),
+    });
+    flow.start();
+    await settle();
+    flow.restart();
+    await settle();
+    cancelOrder.mockClear();
+    flow.dispose();
+    await settle();
+    expect(cancelOrder).toHaveBeenCalledWith('ord-2');
   });
 });

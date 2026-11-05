@@ -84,7 +84,8 @@ export function UploadScreen({ printerId }: { printerId: string }) {
           key={i}
           photo={p}
           index={i}
-          retryDisabled={working}
+          // an expired order cannot take another PUT: only Start over helps
+          retryDisabled={working || flow.phase === 'expired'}
           onRetry={() => flow.retryPhoto(i)}
         />
       ))}
