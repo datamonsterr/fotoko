@@ -546,7 +546,7 @@ async fn jobs_interrupted_by_a_restart_are_reported_failed() {
     assert_eq!(error.code, PiErrorCode::DriverError);
     assert_eq!(error.message, "agent restarted during job");
     cloud.heartbeat_where(PrinterState::Idle).await;
-    // It is closed now: redelivery of that job id is a duplicate.
+    // It is closed as interrupted: the cloud may republish the same job id and it runs.
     cloud
         .publish_job(&job(
             &env.base,
@@ -555,17 +555,10 @@ async fn jobs_interrupted_by_a_restart_are_reported_failed() {
             &[("/land.jpg", ContentType::Jpeg, 1)],
         ))
         .await;
-    cloud
-        .publish_job(&job(
-            &env.base,
-            "job-next",
-            PRINTER,
-            &[("/land.jpg", ContentType::Jpeg, 1)],
-        ))
-        .await;
     let statuses = cloud.job_statuses().await;
+    assert_eq!(statuses.last().unwrap().state, JobState::Completed);
     assert!(
-        statuses.iter().all(|s| s.job_id.as_str() == "job-next"),
+        statuses.iter().all(|s| s.job_id.as_str() == "job-crashed"),
         "{statuses:?}"
     );
     agent.stop().await.unwrap();
@@ -695,7 +688,8 @@ async fn jobs_beyond_the_queue_limit_are_rejected_with_failed() {
             .await;
     }
     let mut rejected = Vec::new();
-    while rejected.len() < total - 1 - fotoko_pi_agent::agent::JOB_QUEUE - 2 {
+    // At most MAX_REJECTS_IN_FLIGHT rejections are published at once; the first burst gets through.
+    while rejected.len() < fotoko_pi_agent::agent::MAX_REJECTS_IN_FLIGHT {
         let status = cloud.next_status().await;
         if let Some(error) = &status.error
             && error.message == "queue full"

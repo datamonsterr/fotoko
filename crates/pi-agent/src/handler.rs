@@ -133,7 +133,7 @@ impl JobHandler {
         state: JobState,
         printed: u32,
         error: Option<PiError>,
-    ) {
+    ) -> bool {
         let status = JobStatus {
             job_id: job_id.into(),
             order_id: order_id.into(),
@@ -144,10 +144,11 @@ impl JobHandler {
             at: Utc::now(),
         };
         match timeout(self.status_timeout, self.sink.status(&status)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => return true,
             Ok(Err(error)) => warn!(%job_id, ?state, %error, "cannot publish job status"),
             Err(_) => warn!(%job_id, ?state, "publishing job status timed out"),
         }
+        false
     }
 
     async fn finish(&self, job_id: &str, order_id: &str, outcome: Outcome) {
@@ -159,23 +160,27 @@ impl JobHandler {
         }
     }
 
-    /// After a restart: report every job the previous run accepted but never finished as failed,
-    /// and close it in the ledger. Returns how many there were.
+    /// After a restart: report every job the previous run accepted but never finished as failed
+    /// (`driver_error`, "agent restarted during job"), then close it as interrupted in the
+    /// ledger, which makes a republish of the same job id acceptable. A job whose report could
+    /// not be published stays open and is reported again at the next start. Returns how many
+    /// jobs were reported.
     pub async fn recover(&self) -> usize {
         let unfinished = self.ledger(|s| s.unfinished()).await.unwrap_or_default();
+        let mut reported = 0;
         for job in &unfinished {
             warn!(job_id = %job.job_id, "job was interrupted by an agent restart");
             let error = failure(PiErrorCode::DriverError, "agent restarted during job");
-            self.finish(
-                &job.job_id,
-                &job.order_id,
-                Outcome::Failed(PiErrorCode::DriverError),
-            )
-            .await;
-            self.report(&job.job_id, &job.order_id, JobState::Failed, 0, Some(error))
+            let published = self
+                .report(&job.job_id, &job.order_id, JobState::Failed, 0, Some(error))
                 .await;
+            if published {
+                self.finish(&job.job_id, &job.order_id, Outcome::Interrupted)
+                    .await;
+                reported += 1;
+            }
         }
-        unfinished.len()
+        reported
     }
 
     /// Handle one message from the jobs topic.
@@ -225,8 +230,13 @@ impl JobHandler {
             }
             Err(error) => {
                 warn!(%job_id, code = ?error.code, message = %error.message, "job failed");
-                self.finish(&job_id, &order_id, Outcome::Failed(error.code))
-                    .await;
+                // A job cut short by shutdown may be run again; anything else is final.
+                let outcome = if self.cancel.is_cancelled() {
+                    Outcome::Interrupted
+                } else {
+                    Outcome::Failed(error.code)
+                };
+                self.finish(&job_id, &order_id, outcome).await;
                 self.report(
                     &job_id,
                     &order_id,
@@ -255,11 +265,12 @@ impl JobHandler {
             })?;
             files.push((file, photo.copies));
         }
-        let ctx = PrintContext {
-            title: job.job_id.to_string(),
-            cancel: self.cancel.clone(),
-        };
-        for (file, copies) in &files {
+        for (index, (file, copies)) in files.iter().enumerate() {
+            // Unique per photo, so a stray CUPS job can be traced to its photo.
+            let ctx = PrintContext {
+                title: format!("{}-{index}", job.job_id),
+                cancel: self.cancel.clone(),
+            };
             self.printer
                 .print(file.path(), *copies, job.media, &ctx)
                 .await
@@ -272,7 +283,13 @@ impl JobHandler {
 
 /// Publish `failed` for a job message that cannot be processed (for example the queue is full).
 /// Messages that are not jobs for this printer are ignored.
-pub async fn reject(sink: &dyn Sink, printer_id: &PrinterId, payload: &[u8], message: &str) {
+pub async fn reject(
+    sink: &dyn Sink,
+    printer_id: &PrinterId,
+    payload: &[u8],
+    message: &str,
+    wait: Duration,
+) {
     let Ok(job) = serde_json::from_slice::<PrintJob>(payload) else {
         return;
     };
@@ -288,8 +305,10 @@ pub async fn reject(sink: &dyn Sink, printer_id: &PrinterId, payload: &[u8], mes
         error: Some(failure(PiErrorCode::DriverError, message)),
         at: Utc::now(),
     };
-    if let Err(error) = sink.status(&status).await {
-        warn!(%error, "cannot publish rejection");
+    match timeout(wait, sink.status(&status)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "cannot publish rejection"),
+        Err(_) => warn!("publishing rejection timed out"),
     }
 }
 
@@ -348,6 +367,8 @@ pub(crate) mod tests {
     use std::io::Cursor;
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    const WAIT: Duration = Duration::from_secs(5);
 
     #[derive(Default)]
     pub struct Recorder {
@@ -572,7 +593,13 @@ pub(crate) mod tests {
         );
         assert!(printed[0].0.ends_with("j1-0-p0.png"), "{:?}", printed[0].0);
         assert!(printed[1].0.ends_with("j1-1-p1.png"));
-        assert!(printed.iter().all(|(_, _, title)| title == "j1"));
+        assert_eq!(
+            printed
+                .iter()
+                .map(|(_, _, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["j1-0", "j1-1"]
+        );
         assert!(tmp_is_empty(&f), "temp files are cleaned");
     }
 
@@ -904,12 +931,28 @@ pub(crate) mod tests {
             (error.code, error.message.as_str()),
             (PiErrorCode::DriverError, "agent restarted during job")
         );
-        // Closed in the ledger: no second report, and the job id now counts as failed.
+        // Closed in the ledger: no second report, and a republish of that job id is accepted.
         assert_eq!(f.handler.recover().await, 0);
         assert_eq!(
             f.handler.handle(&one(&f.base, "crashed")).await,
-            Handled::Duplicate
+            Handled::Completed { printed: 1 }
         );
+    }
+
+    #[tokio::test]
+    async fn recover_keeps_a_job_open_when_its_report_cannot_be_published() {
+        let f = fixture().await;
+        f.handler
+            .ledger(|s| s.begin("crashed", "order-crashed"))
+            .await
+            .unwrap()
+            .unwrap();
+        *f.sink.fail.lock().unwrap() = true;
+        assert_eq!(f.handler.recover().await, 0);
+        assert_eq!(f.handler.ledger(|s| s.unfinished().len()).await, Some(1));
+        *f.sink.fail.lock().unwrap() = false;
+        assert_eq!(f.handler.recover().await, 1);
+        assert_eq!(f.handler.ledger(|s| s.unfinished().len()).await, Some(0));
     }
 
     #[tokio::test]
@@ -929,6 +972,10 @@ pub(crate) mod tests {
             (PiErrorCode::DriverError, "print cancelled")
         );
         assert!(tmp_is_empty(&f));
+        assert_eq!(
+            f.handler.ledger(|s| s.outcome("j1")).await,
+            Some(Some(Outcome::Interrupted))
+        );
     }
 
     #[tokio::test]
@@ -951,6 +998,10 @@ pub(crate) mod tests {
         };
         assert_eq!(error.message, "agent shutting down");
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            f.handler.ledger(|s| s.outcome("j1")).await,
+            Some(Some(Outcome::Interrupted))
+        );
         assert!(tmp_is_empty(&f));
     }
 
@@ -958,7 +1009,7 @@ pub(crate) mod tests {
     async fn reject_publishes_failed_for_our_jobs_only() {
         let sink = Recorder::default();
         let me = PrinterId::new("stand-001").unwrap();
-        reject(&sink, &me, &one("http://x", "j1"), "queue full").await;
+        reject(&sink, &me, &one("http://x", "j1"), "queue full", WAIT).await;
         reject(
             &sink,
             &me,
@@ -969,17 +1020,35 @@ pub(crate) mod tests {
                 &[("/a", ContentType::Png, 1)],
             ),
             "queue full",
+            WAIT,
         )
         .await;
-        reject(&sink, &me, b"garbage", "queue full").await;
+        reject(&sink, &me, b"garbage", "queue full", WAIT).await;
         let statuses = sink.statuses.lock().unwrap().clone();
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].job_id.as_str(), "j1");
         assert_eq!(statuses[0].state, JobState::Failed);
         assert_eq!(statuses[0].error.as_ref().unwrap().message, "queue full");
         *sink.fail.lock().unwrap() = true;
-        reject(&sink, &me, &one("http://x", "j3"), "queue full").await;
+        reject(&sink, &me, &one("http://x", "j3"), "queue full", WAIT).await;
         assert_eq!(sink.statuses.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reject_gives_up_on_a_stuck_sink() {
+        let sink = Recorder::default();
+        *sink.hang.lock().unwrap() = true;
+        let me = PrinterId::new("stand-001").unwrap();
+        let started = std::time::Instant::now();
+        reject(
+            &sink,
+            &me,
+            &one("http://x", "j1"),
+            "queue full",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

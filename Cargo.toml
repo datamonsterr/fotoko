@@ -57,6 +57,9 @@ incremental = false
 debug = false
 
 # Image decoding and resizing are far too slow unoptimized (printer-sim and pi-agent tests).
+# The decode chain is image -> png (-> fdeflate, flate2 -> miniz_oxide, crc32fast, simd-adler32)
+# and zune-jpeg (-> zune-core); moxcms/pxfm come with image's colour handling. Keep this list in
+# step with `cargo tree -p fotoko-printer-sim` when image is upgraded.
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.png]

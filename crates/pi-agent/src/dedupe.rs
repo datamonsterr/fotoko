@@ -2,8 +2,10 @@
 //! job from printing twice, even across restarts, and finds jobs a crash left unfinished.
 //!
 //! The cloud republishes an order's job under the same job id, so a job id is only refused while
-//! it is in progress or ended well. A job that failed with `download_failed` (typically an expired
-//! presigned URL) may be accepted again.
+//! it is in progress or ended for good. Retriable endings, after which the same job id is
+//! accepted again: `download_failed` (typically an expired presigned URL) and `interrupted`
+//! (the agent restarted or shut down in the middle of the job; reported to the cloud as a
+//! `driver_error` failure).
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -36,6 +38,18 @@ pub enum Outcome {
     Completed,
     /// Failed with this code.
     Failed(PiErrorCode),
+    /// Cut short by an agent restart or shutdown; the job may be run again.
+    Interrupted,
+}
+
+impl Outcome {
+    /// Whether a republished job with the same id is accepted after this ending.
+    pub fn is_retriable(self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted | Self::Failed(PiErrorCode::DownloadFailed)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +75,9 @@ pub struct DedupeStore {
     path: PathBuf,
     file: File,
     entries: HashMap<String, Entry>,
+    /// Job ids by time of last update, oldest first.
+    order: VecDeque<String>,
+    limit: usize,
 }
 
 impl DedupeStore {
@@ -83,7 +100,6 @@ impl DedupeStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(err(e)),
         };
-        // Order of last update, oldest first.
         let mut order: VecDeque<String> = VecDeque::new();
         let mut entries: HashMap<String, Entry> = HashMap::new();
         for entry in text
@@ -96,33 +112,56 @@ impl DedupeStore {
         }
         let torn = !text.is_empty() && !text.ends_with('\n');
         let lines = text.lines().count();
-        if order.len() > limit || torn || lines > order.len() * 2 + 16 {
-            while order.len() > limit {
-                if let Some(old) = order.pop_front() {
-                    entries.remove(&old);
-                }
-            }
-            let mut rewritten = String::new();
-            for id in &order {
-                if let Some(entry) = entries.get(id) {
-                    rewritten.push_str(&serde_json::to_string(entry).map_err(|e| err(e.into()))?);
-                    rewritten.push('\n');
-                }
-            }
-            let tmp = path.with_extension("tmp");
-            fs::write(&tmp, rewritten).map_err(err)?;
-            fs::rename(&tmp, &path).map_err(err)?;
-        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(err)?;
-        Ok(Self {
+        let mut store = Self {
             path,
             file,
             entries,
-        })
+            order,
+            limit,
+        };
+        if store.order.len() > limit || torn || lines > store.order.len() * 2 + 16 {
+            store.compact()?;
+        }
+        Ok(store)
+    }
+
+    /// Rewrite the file with the newest [`Self::limit`] jobs, one line each, durably (file and
+    /// directory are synced before and after the rename).
+    fn compact(&mut self) -> Result<(), StoreError> {
+        let err = |source| StoreError {
+            path: self.path.clone(),
+            source,
+        };
+        while self.order.len() > self.limit {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        let mut rewritten = String::new();
+        for id in &self.order {
+            if let Some(entry) = self.entries.get(id) {
+                rewritten.push_str(&serde_json::to_string(entry).map_err(|e| err(e.into()))?);
+                rewritten.push('\n');
+            }
+        }
+        let tmp = self.path.with_extension("tmp");
+        let mut out = File::create(&tmp).map_err(err)?;
+        out.write_all(rewritten.as_bytes()).map_err(err)?;
+        out.sync_all().map_err(err)?;
+        fs::rename(&tmp, &self.path).map_err(err)?;
+        if let Some(dir) = self.path.parent() {
+            File::open(dir).and_then(|d| d.sync_all()).map_err(err)?;
+        }
+        self.file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(err)?;
+        Ok(())
     }
 
     /// A ledger whose writes always fail (`/dev/full`), for testing error handling.
@@ -137,6 +176,8 @@ impl DedupeStore {
             path,
             file,
             entries: HashMap::new(),
+            order: VecDeque::new(),
+            limit: MAX_REMEMBERED,
         }
     }
 
@@ -149,7 +190,12 @@ impl DedupeStore {
         line.push('\n');
         self.file.write_all(line.as_bytes()).map_err(err)?;
         self.file.sync_data().map_err(err)?;
+        self.order.retain(|id| *id != entry.job_id);
+        self.order.push_back(entry.job_id.clone());
         self.entries.insert(entry.job_id.clone(), entry);
+        if self.entries.len() > self.limit * 2 {
+            self.compact()?;
+        }
         Ok(())
     }
 
@@ -168,7 +214,7 @@ impl DedupeStore {
     pub fn begin(&mut self, job_id: &str, order_id: &str) -> Result<bool, StoreError> {
         let retriable = match self.entries.get(job_id) {
             None => true,
-            Some(entry) => entry.outcome == Some(Outcome::Failed(PiErrorCode::DownloadFailed)),
+            Some(entry) => entry.outcome.is_some_and(Outcome::is_retriable),
         };
         if !retriable {
             return Ok(false);
@@ -265,6 +311,41 @@ mod tests {
         drop(store);
         let mut store = DedupeStore::open(dir.path()).unwrap();
         assert!(store.begin("b", "o").unwrap());
+    }
+
+    #[test]
+    fn interrupted_jobs_may_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DedupeStore::open(dir.path()).unwrap();
+        store.begin("a", "o").unwrap();
+        store.finish("a", "o", Outcome::Interrupted).unwrap();
+        assert!(Outcome::Interrupted.is_retriable());
+        assert!(!Outcome::Completed.is_retriable());
+        assert!(store.begin("a", "o").unwrap());
+        drop(store);
+        let store = DedupeStore::open(dir.path()).unwrap();
+        assert_eq!(store.unfinished().len(), 1, "the retry is in progress");
+    }
+
+    #[test]
+    fn compacts_while_running_when_far_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DedupeStore::open_with_limit(dir.path(), 3).unwrap();
+        for n in 0..20 {
+            store.begin(&format!("j{n}"), "o").unwrap();
+        }
+        assert!(store.entries.len() <= 6, "{}", store.entries.len());
+        let lines = fs::read_to_string(dir.path().join(FILE_NAME))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(lines <= 6 + 3, "{lines}");
+        assert!(store.contains("j19") && !store.contains("j0"));
+        // Appends after a compaction still land in the (new) file.
+        store.begin("after", "o").unwrap();
+        drop(store);
+        let store = DedupeStore::open_with_limit(dir.path(), 3).unwrap();
+        assert!(store.contains("after") && store.contains("j19"));
     }
 
     #[test]
