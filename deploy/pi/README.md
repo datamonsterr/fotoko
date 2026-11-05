@@ -32,7 +32,7 @@ bash deploy/pi/build.sh                                         # -> deploy/pi/d
 
 ### 3. Flash and boot the Pi
 
-Raspberry Pi Imager, "Raspberry Pi OS Lite (64-bit)". In the advanced settings set hostname, a non-default user, ssh with your public key (disable password login) and the Wi-Fi network. Boot, connect the printer by USB, then check `lsusb` shows it and `ssh <user>@<hostname>.local` works. Details and a nmcli alternative: `wifi-and-hardening.md`.
+Raspberry Pi Imager, "Raspberry Pi OS Lite (64-bit)". In the advanced settings set hostname, a non-default user, ssh with your public key (disable password login) and the Wi-Fi network. Boot, connect the printer by USB, then check `lsusb` shows it and `ssh <user>@<ip-or-dns-name>` works (use the IP or a DNS name in all commands below; `<hostname>.local` relies on avahi, which `--disable-avahi` turns off). Details and a nmcli alternative: `wifi-and-hardening.md`.
 
 ### 4. Find the printer driver
 
@@ -50,11 +50,11 @@ Pass the model string as `--model`. The USB device URI is autodetected when exac
 First install (copies binary + certs, runs `install.sh`; everything after `--` goes to `install.sh`):
 
 ```sh
-bash deploy/pi/deploy.sh stand-001.local --user pi --certs ./printer-out/stand-001 -- \
-  --model gutenprint.5.3://canon-selphy-cp1300/expert --ssh-from 192.168.1.0/24 --disable-bluetooth --disable-avahi
+bash deploy/pi/deploy.sh 192.168.1.50 --user pi --certs ./printer-out/stand-001 --ssh-from 192.168.1.0/24 -- \
+  --model gutenprint.5.3://canon-selphy-cp1300/expert --disable-bluetooth --disable-avahi
 ```
 
-Or by hand on the Pi: copy `deploy/pi/` plus `dist/fotoko-pi-agent` and the cert directory, then `sudo ./install.sh --certs ./certs --model ... [--device-uri ...]`. Preview any run with `--dry-run`.
+Or by hand on the Pi: copy `deploy/pi/` plus `dist/fotoko-pi-agent` and the cert directory, then `sudo ./install.sh --certs ./certs --model ... (--ssh-from CIDR | --skip-firewall) [--device-uri ...]`. Over ssh, `install.sh` refuses to enable the firewall without `--ssh-from` (it would cut your session); `deploy.sh --certs` likewise needs `--ssh-from` or `--skip-firewall`. Preview any run with `--dry-run`.
 
 What `install.sh` sets up:
 
@@ -62,22 +62,25 @@ What `install.sh` sets up:
 - System user `fotoko` (no login, no extra groups). `lp`/`lpstat`/`cancel` work for any local user over the CUPS socket, so the agent gets no `lpadmin`/`lp` group.
 - `/etc/fotoko` 0750 root:fotoko (`agent.toml` 0640; CA and cert 0444; `private.pem.key` 0400 fotoko, the agent refuses anything looser), `/var/lib/fotoko` 0750 fotoko, `/usr/local/bin/fotoko-pi-agent`.
 - CUPS queue `fotoko` (`lpadmin -E`), default media `w288h432`, local only (`cupsctl --no-remote-admin --no-share-printers --no-remote-any`, `cups-browsed` disabled), `PreserveJobHistory Yes` (the agent reads `lpstat -W completed` to learn how a job ended).
-- `printer-error-policy=stop-printer`: on a paper or ribbon error CUPS disables the queue and keeps the job. The agent sees `disabled` in `lpstat -p` and reports `paper_out`/`ribbon_out` to the cloud. `abort-job` would drop the print and leave the queue looking healthy, so a customer could be charged for nothing. After refilling run `sudo cupsenable fotoko` and the job resumes.
+- `printer-error-policy=stop-printer`: on a paper or ribbon error CUPS stops the queue and holds the job. The agent sees the stopped queue in `lpstat -p`, cancels the failed job and reports it failed (`paper_out`/`ribbon_out`), so the customer's order is reported failed rather than lost silently. `abort-job` would drop the print and leave the queue looking healthy. After fixing the cause the operator re-enables the queue with `sudo cupsenable fotoko`; the failed job is not reprinted.
+- `install.sh` also checks `cupsd.conf` (job history on, `Listen` loopback only), warns when `--queue`/`--media` differ from `agent.toml` or the driver does not list the media, and writes `/etc/apt/apt.conf.d/20auto-upgrades`.
 - ufw: deny incoming, allow outgoing, ssh only from `--ssh-from` (no inbound ssh without it, so keep console access). Without ufw, or with `--skip-firewall`, set an equivalent nftables policy yourself.
 - `unattended-upgrades`, `systemd-timesyncd`, and the `fotoko-agent` unit (enabled and started).
 
 Upgrade (binary only, keeps the old one as `fotoko-pi-agent.prev`):
 
 ```sh
-bash deploy/pi/build.sh && bash deploy/pi/deploy.sh stand-001.local
+bash deploy/pi/build.sh && bash deploy/pi/deploy.sh 192.168.1.50
 ```
 
-`deploy.sh` verifies the sha256 after copying, restarts, waits 5 s, checks `systemctl is-active`, shows the journal tail and restores `.prev` if the service is not active.
+`deploy.sh` verifies the sha256 after copying, restarts, then waits up to 60 s for `systemctl is-active` and the agent log line `connected to broker`. On failure it restores `.prev`. With `--certs` it first archives `/etc/fotoko` to `/var/lib/fotoko/backup-<ts>.tar` (0600 root, newest 3 kept) and restores it, plus the previous binary, if `install.sh` fails or the health check fails. A failed `install.sh` may already have changed CUPS or ufw settings; those are not rolled back (re-run after fixing). The temp dir on the Stand, including the private key, is shredded afterwards; if that cleanup fails `deploy.sh` prints the path loudly.
+
+In `agent.toml` with `backend = "sim"` (no printer, for bench tests) `sim.out_dir` must be under `/var/lib/fotoko`: the unit is `ProtectSystem=strict` and only that path is writable.
 
 ### 6. Verify
 
 ```sh
-ssh pi@stand-001.local
+ssh pi@192.168.1.50
 systemctl is-active fotoko-agent            # active
 journalctl -u fotoko-agent -n 50 --no-pager # "connected" / heartbeat lines, no TLS errors
 lpstat -p fotoko                            # printer fotoko is idle.  enabled since ...
@@ -93,7 +96,7 @@ End-to-end: create an order for the Stand in the app (or publish a test job as i
 pnpm --filter @fotoko/infra provision-printer --printer-id stand-001 --stage prod --out ./printer-out/stand-001-new --rotate
 ```
 
-Rotation retires the old certificate immediately, so the Stand is offline until the new files are installed. Back up the old files first, then run `deploy.sh stand-001.local --certs ./printer-out/stand-001-new -- --model <same model>` (re-running `install.sh` is idempotent; the existing CUPS queue is reconfigured in place) and check `journalctl -u fotoko-agent`.
+Rotation retires the old certificate immediately, so the Stand is offline until the new files are installed. `deploy.sh` backs up `/etc/fotoko` and restores it if the new files fail, but that only helps when the old certificate is still valid: `--rotate` has already deleted it in AWS, so after a failed install fix the cause and re-run with the new files (or provision again). Run `deploy.sh 192.168.1.50 --certs ./printer-out/stand-001-new -- --model <same model>` (re-running `install.sh` is idempotent; the existing CUPS queue is reconfigured in place) and check `journalctl -u fotoko-agent`.
 
 ## Troubleshooting
 
