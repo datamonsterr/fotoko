@@ -79,7 +79,11 @@ export class FotokoStack extends Stack {
     });
     new Monitoring(this, 'Monitoring', {
       config,
-      functions: { Http: functions.http, IotStatus: functions.iotStatus },
+      functions: {
+        Http: functions.http,
+        IotStatus: functions.iotStatus,
+        Expire: functions.expire,
+      },
       apiStage: api.stage,
       iotRuleName: iot.ruleName,
     });
