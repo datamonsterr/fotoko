@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "8bd274cd94c3c9fa9f7dffb00df6b4303a6507d37aee185e2b9c088922483c96",
+  "source": "https://github.com/apollographql/skills/tree/HEAD/skills/rust-best-practices",
+  "ref": "HEAD",
+  "revision": "9dda1397730370aeb8df4ff8f2015c34c86b5003",
+  "category": "backend/rust",
+  "installedAt": "2026-11-05T09:19:19.533Z"
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "48b2ac43759c3bbaa01c24c341f3eaaf489a542f1976c20ed3d2edacd55b6348",
+  "source": "https://github.com/getsentry/skills/tree/HEAD/skills/agents-md",
+  "ref": "HEAD",
+  "revision": "0c464f411bdfb8d4c12314b36264d06cb2f60270",
+  "category": "docs",
+  "installedAt": "2026-11-05T09:19:30.810Z"
+}
