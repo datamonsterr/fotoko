@@ -28,16 +28,47 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// In-memory [`OrderRepo`].
+/// Failure injection shared by the in-memory adapters: an operation (the port method name, for
+/// example `"exists"`) fails with the configured error until cleared.
+#[derive(Debug, Clone, Default)]
+struct Faults {
+    errors: Arc<Mutex<HashMap<&'static str, CoreError>>>,
+}
+
+impl Faults {
+    fn set(&self, op: &'static str, error: Option<CoreError>) {
+        let mut errors = lock(&self.errors);
+        match error {
+            Some(error) => errors.insert(op, error),
+            None => errors.remove(op),
+        };
+    }
+
+    fn check(&self, op: &'static str) -> Result<(), CoreError> {
+        match lock(&self.errors).get(op) {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// In-memory [`OrderRepo`]. [`fail_with`](Self::fail_with) injects failures per port method
+/// (`get`, `get_by_order_code`, `insert`, `update`, `list_due_for_expiry`).
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryOrderRepo {
     orders: Arc<Mutex<HashMap<OrderId, Order>>>,
+    faults: Faults,
 }
 
 impl InMemoryOrderRepo {
     /// Empty repo.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make port method `op` fail with `error`, or work again with `None`.
+    pub fn fail_with(&self, op: &'static str, error: Option<CoreError>) {
+        self.faults.set(op, error);
     }
 
     /// The stored order, for assertions.
@@ -56,10 +87,12 @@ impl InMemoryOrderRepo {
 #[async_trait]
 impl OrderRepo for InMemoryOrderRepo {
     async fn get(&self, order_id: &OrderId) -> Result<Option<Order>, CoreError> {
+        self.faults.check("get")?;
         Ok(self.snapshot(order_id))
     }
 
     async fn get_by_order_code(&self, order_code: i64) -> Result<Option<Order>, CoreError> {
+        self.faults.check("get_by_order_code")?;
         Ok(lock(&self.orders)
             .values()
             .find(|o| o.order_code == Some(order_code))
@@ -67,6 +100,7 @@ impl OrderRepo for InMemoryOrderRepo {
     }
 
     async fn insert(&self, order: &Order) -> Result<(), CoreError> {
+        self.faults.check("insert")?;
         let mut orders = lock(&self.orders);
         if orders.contains_key(&order.order_id) {
             return Err(CoreError::Conflict(format!(
@@ -79,6 +113,7 @@ impl OrderRepo for InMemoryOrderRepo {
     }
 
     async fn update(&self, order: &Order, expected: OrderStatus) -> Result<(), CoreError> {
+        self.faults.check("update")?;
         let mut orders = lock(&self.orders);
         let Some(stored) = orders.get_mut(&order.order_id) else {
             return Err(CoreError::NotFound(format!(
@@ -97,6 +132,7 @@ impl OrderRepo for InMemoryOrderRepo {
     }
 
     async fn list_due_for_expiry(&self, now: DateTime<Utc>) -> Result<Vec<Order>, CoreError> {
+        self.faults.check("list_due_for_expiry")?;
         let mut due: Vec<Order> = lock(&self.orders)
             .values()
             .filter(|o| o.is_due_for_expiry(now))
@@ -107,16 +143,23 @@ impl OrderRepo for InMemoryOrderRepo {
     }
 }
 
-/// In-memory [`PrinterRepo`].
+/// In-memory [`PrinterRepo`]. [`fail_with`](Self::fail_with) injects failures per port method
+/// (`get`, `update_status`).
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryPrinterRepo {
     printers: Arc<Mutex<HashMap<PrinterId, Printer>>>,
+    faults: Faults,
 }
 
 impl InMemoryPrinterRepo {
     /// Empty repo.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make port method `op` fail with `error`, or work again with `None`.
+    pub fn fail_with(&self, op: &'static str, error: Option<CoreError>) {
+        self.faults.set(op, error);
     }
 
     /// Add or replace a printer (seeding; not part of the port).
@@ -133,6 +176,7 @@ impl InMemoryPrinterRepo {
 #[async_trait]
 impl PrinterRepo for InMemoryPrinterRepo {
     async fn get(&self, printer_id: &PrinterId) -> Result<Option<Printer>, CoreError> {
+        self.faults.check("get")?;
         Ok(self.snapshot(printer_id))
     }
 
@@ -142,6 +186,7 @@ impl PrinterRepo for InMemoryPrinterRepo {
         status: PrinterStatus,
         last_seen_at: DateTime<Utc>,
     ) -> Result<(), CoreError> {
+        self.faults.check("update_status")?;
         let mut printers = lock(&self.printers);
         let Some(printer) = printers.get_mut(printer_id) else {
             return Err(CoreError::NotFound(format!(
@@ -156,15 +201,23 @@ impl PrinterRepo for InMemoryPrinterRepo {
 
 /// In-memory [`ObjectStore`]. Presigned URLs are fake `https://store.test/...` strings; an
 /// object "exists" once [`mark_uploaded`](Self::mark_uploaded) was called for its key.
+/// [`fail_with`](Self::fail_with) injects failures per port method (`presign_put`,
+/// `presign_get`, `exists`).
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryObjectStore {
     objects: Arc<Mutex<HashSet<String>>>,
+    faults: Faults,
 }
 
 impl InMemoryObjectStore {
     /// Empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make port method `op` fail with `error`, or work again with `None`.
+    pub fn fail_with(&self, op: &'static str, error: Option<CoreError>) {
+        self.faults.set(op, error);
     }
 
     /// Pretend the client PUT the object.
@@ -183,6 +236,7 @@ impl InMemoryObjectStore {
 #[async_trait]
 impl ObjectStore for InMemoryObjectStore {
     async fn presign_put(&self, spec: &PutSpec) -> Result<PresignedPut, CoreError> {
+        self.faults.check("presign_put")?;
         let content_type = serde_json::to_value(spec.content_type)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -199,6 +253,7 @@ impl ObjectStore for InMemoryObjectStore {
     }
 
     async fn presign_get(&self, key: &str, ttl: std::time::Duration) -> Result<String, CoreError> {
+        self.faults.check("presign_get")?;
         Ok(format!(
             "https://store.test/{key}?op=get&ttl={}",
             ttl.as_secs()
@@ -206,6 +261,7 @@ impl ObjectStore for InMemoryObjectStore {
     }
 
     async fn exists(&self, key: &str) -> Result<bool, CoreError> {
+        self.faults.check("exists")?;
         Ok(lock(&self.objects).contains(key))
     }
 }
@@ -781,5 +837,83 @@ mod tests {
         assert_eq!(h.clock.now(), ts("2026-01-01T00:00:00Z"));
         assert!(h.orders.all().is_empty());
         let _ = Harness::default();
+    }
+
+    #[tokio::test]
+    async fn injected_failures_hit_every_port_method_and_clear() {
+        let boom = || CoreError::Internal("boom".into());
+        let o = order(
+            "o1",
+            Some(5),
+            OrderStatus::AwaitingUpload,
+            "2026-01-01T00:15:00Z",
+        );
+        let id = PrinterId::new("stand-001").expect("id");
+        let now = ts("2026-01-01T00:00:00Z");
+
+        let repo = InMemoryOrderRepo::new();
+        for op in [
+            "get",
+            "get_by_order_code",
+            "insert",
+            "update",
+            "list_due_for_expiry",
+        ] {
+            repo.fail_with(op, Some(boom()));
+        }
+        assert_eq!(repo.get(&o.order_id).await, Err(boom()));
+        assert_eq!(repo.get_by_order_code(5).await, Err(boom()));
+        assert_eq!(repo.insert(&o).await, Err(boom()));
+        assert_eq!(
+            repo.update(&o, OrderStatus::AwaitingUpload).await,
+            Err(boom())
+        );
+        assert_eq!(repo.list_due_for_expiry(now).await, Err(boom()));
+        for op in [
+            "get",
+            "get_by_order_code",
+            "insert",
+            "update",
+            "list_due_for_expiry",
+        ] {
+            repo.fail_with(op, None);
+        }
+        assert_eq!(repo.insert(&o).await, Ok(()));
+        assert_eq!(repo.get(&o.order_id).await, Ok(Some(o.clone())));
+
+        let printers = InMemoryPrinterRepo::new();
+        printers.fail_with("get", Some(boom()));
+        printers.fail_with("update_status", Some(boom()));
+        assert_eq!(printers.get(&id).await, Err(boom()));
+        assert_eq!(
+            printers.update_status(&id, PrinterStatus::Busy, now).await,
+            Err(boom())
+        );
+        printers.fail_with("get", None);
+        printers.fail_with("update_status", None);
+        assert_eq!(printers.get(&id).await, Ok(None));
+
+        let store = InMemoryObjectStore::new();
+        let spec = PutSpec {
+            key: "k".into(),
+            content_type: ContentType::Png,
+            size_bytes: 1,
+            ttl: std::time::Duration::from_secs(1),
+        };
+        for op in ["presign_put", "presign_get", "exists"] {
+            store.fail_with(op, Some(boom()));
+        }
+        assert_eq!(store.presign_put(&spec).await, Err(boom()));
+        assert_eq!(
+            store
+                .presign_get("k", std::time::Duration::from_secs(1))
+                .await,
+            Err(boom())
+        );
+        assert_eq!(store.exists("k").await, Err(boom()));
+        for op in ["presign_put", "presign_get", "exists"] {
+            store.fail_with(op, None);
+        }
+        assert_eq!(store.exists("k").await, Ok(false));
     }
 }
