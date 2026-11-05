@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Fotoko",
+    "slug": "fotoko",
+    "version": "0.1.0",
+    "scheme": "fotoko",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "platforms": ["ios", "android", "web"],
+    "ios": {
+      "bundleIdentifier": "vn.fotoko.app",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "vn.fotoko.app"
+    },
+    "web": {
+      "output": "single",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-localization",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Fotoko dùng máy ảnh để quét mã QR trên máy in. / Fotoko uses the camera to scan the QR code on the printer.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Fotoko cần truy cập ảnh để bạn chọn ảnh in. / Fotoko needs your photos so you can pick prints."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

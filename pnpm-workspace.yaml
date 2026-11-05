@@ -4,4 +4,5 @@ packages:
   - infra/*
 
 allowBuilds:
+  '@parcel/watcher': true
   lefthook: true
