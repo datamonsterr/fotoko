@@ -38,6 +38,7 @@ jobs:
       shell: ${{ steps.resolve.outputs.shell }}
       workflows: ${{ steps.resolve.outputs.workflows }}
       js_pkgs: ${{ steps.resolve.outputs.js_pkgs }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
       has_api: ${{ steps.resolve.outputs.has_api }}
       has_compose: ${{ steps.resolve.outputs.has_compose }}
       has_e2e_crate: ${{ steps.resolve.outputs.has_e2e_crate }}
@@ -78,6 +79,7 @@ jobs:
               - 'packages/**'
             infra:
               - 'infra/**'
+              - 'apps/mobile/**'
               - 'scripts/deploy/**'
             e2e:
               - 'crates/**'
@@ -136,6 +138,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
+      # The rust-test matrix comes from `cargo metadata`, so new crates join without editing CI.
+      # Plain cargo (preinstalled stable, no toolchain install or cache): metadata does not compile.
+      - id: matrix
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: echo "matrix=$(python3 -I scripts/ci/cargo_meta.py test-matrix)" >> "$GITHUB_OUTPUT"
+
   # ---------- Rust ----------
 
   rust-lint:
@@ -157,33 +166,15 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: bash scripts/ci/summary.sh rust-lint "bash scripts/ci/repro.sh rust-lint" "cargo fmt --all --check" "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
-  # The test matrix is generated from `cargo metadata`, so new crates join without editing CI.
-  rust-matrix:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: matrix
-      - id: matrix
-        run: echo "matrix=$(python3 -I scripts/ci/cargo_meta.py test-matrix)" >> "$GITHUB_OUTPUT"
-
   rust-test:
     name: rust-test (${{ matrix.crate }})
-    needs: [changes, rust-matrix]
+    needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.rust-matrix.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     env:
       CRATE: ${{ matrix.crate }}
     steps:
@@ -396,7 +387,7 @@ jobs:
       # The stack under test (fotoko-local, pi-agent sim, payOS mock) builds from source.
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: e2e
+          cache-key: web-e2e
       - uses: ./.github/actions/setup-js
       - run: bash scripts/ci/repro.sh web-e2e
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -465,7 +456,6 @@ jobs:
     needs:
       - changes
       - rust-lint
-      - rust-matrix
       - rust-test
       - rust-integration
       - rust-e2e
@@ -490,7 +480,7 @@ jobs:
             "### ci-ok", "",
             "| job | result | reproduce locally |", "| --- | --- | --- |",
             (to_entries[] | "| \(.key) | \(.value.result) | " +
-              (if (.value.result == "failure" or .value.result == "cancelled") and (.key | IN("changes", "rust-matrix") | not)
+              (if (.value.result == "failure" or .value.result == "cancelled") and (.key != "changes")
                then "`bash scripts/ci/repro.sh \(.key)`" else "" end) + " |")
           ' <<<"$NEEDS" >> "$GITHUB_STEP_SUMMARY"
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
