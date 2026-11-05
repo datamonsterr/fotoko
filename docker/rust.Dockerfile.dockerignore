@@ -1,7 +1,6 @@
 **
 !Cargo.toml
 !Cargo.lock
-!rust-toolchain.toml
 !rustfmt.toml
 !clippy.toml
 !crates/**

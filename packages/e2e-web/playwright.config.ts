@@ -10,6 +10,7 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,
+  // No retries: a flaky stack should fail loudly; the report and sim logs show why.
   retries: 0,
   timeout: 90_000,
   expect: { timeout: 15_000 },

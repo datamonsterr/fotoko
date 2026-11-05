@@ -431,3 +431,36 @@ async fn a_restart_mid_job_fails_the_order_and_a_webhook_retry_does_not_reprint(
         OrderStatus::Failed
     );
 }
+
+#[tokio::test]
+async fn an_order_placed_while_another_job_prints_queues_and_both_complete() {
+    let s = Stack::start(StackOptions {
+        page_latency_ms: 1000,
+        ..StackOptions::default()
+    })
+    .await;
+    let first = s.place_paid_order("guest-first", &two_photos()).await;
+    // The heartbeat of a printing Pi marks the printer busy; it still takes orders.
+    s.wait_printer(PrinterStatus::Busy).await;
+    let (status, body) = s
+        .call(Method::GET, "/v1/printers/stand-001", None, None)
+        .await;
+    assert_eq!((status, body["status"].as_str()), (200, Some("busy")));
+
+    let second = s
+        .place_paid_order("guest-second", &[landscape_jpeg(1)])
+        .await;
+    s.wait_order_status("guest-first", &first.order_id, OrderStatus::Completed)
+        .await;
+    s.wait_order_status("guest-second", &second.order_id, OrderStatus::Completed)
+        .await;
+    // 3 pages for the first order, 1 for the second, nothing mixed up.
+    let pages = s.wait_pages(4).await;
+    let of = |order: &str| {
+        pages
+            .iter()
+            .filter(|p| p.name.starts_with(&format!("job-{order}-")))
+            .count()
+    };
+    assert_eq!((of(&first.order_id), of(&second.order_id)), (3, 1));
+}

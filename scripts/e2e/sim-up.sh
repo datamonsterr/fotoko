@@ -9,7 +9,7 @@
 # Environment:
 #   FOTOKO_E2E_DIR         state directory (logs, pids, printer output)
 #   FOTOKO_E2E_SKIP_BUILD  1 = use the binaries and web export of the last run
-set -euo pipefail
+set -Eeuo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -18,21 +18,45 @@ sim="${FOTOKO_E2E_DIR:-$here/.sim}"
 # A previous run that was not stopped.
 bash "$here/sim-down.sh" >/dev/null
 
-free_port() {
-    node -e 'const s = require("node:net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });'
+# `count` distinct free ports: all listeners are open at once (so no port repeats), then closed.
+free_ports() {
+    node -e '
+const net = require("node:net");
+const count = Number(process.argv[1]);
+const servers = [];
+let ports = [];
+for (let i = 0; i < count; i++) {
+  const server = net.createServer();
+  servers.push(server);
+  server.listen(0, "127.0.0.1", () => {
+    ports.push(server.address().port);
+    if (ports.length === count) {
+      console.log(ports.join(" "));
+      servers.forEach((s) => s.close());
+    }
+  });
+}' "$1"
 }
+
+on_failure() {
+    trap - ERR INT TERM
+    echo "sim-up: failed, stopping" >&2
+    bash "$here/sim-down.sh" >/dev/null || true
+}
+trap on_failure ERR
+trap 'on_failure; exit 130' INT TERM
 
 rm -rf "$sim/logs" "$sim/pids" "$sim/pi" "$sim/objects"
 mkdir -p "$sim/logs" "$sim/pids"
 
-broker_port="$(free_port)"
-api_port="$(free_port)"
-mock_port="$(free_port)"
-if [ "${FOTOKO_E2E_SKIP_BUILD:-0}" = 1 ] && [ -f "$sim/ports" ]; then
+read -r broker_port api_port mock_port gateway_port < <(free_ports 4)
+if [ "${FOTOKO_E2E_SKIP_BUILD:-0}" = 1 ]; then
     # The web export has the gateway address built in, so a reused export needs the same port.
+    if [ ! -f "$sim/ports" ] || [ ! -d "$sim/dist-web" ]; then
+        echo "sim-up: FOTOKO_E2E_SKIP_BUILD=1 needs the web export and ports of an earlier run" >&2
+        exit 1
+    fi
     gateway_port="$(cat "$sim/ports")"
-else
-    gateway_port="$(free_port)"
 fi
 gateway_url="http://127.0.0.1:$gateway_port"
 api_url="http://127.0.0.1:$api_port"
@@ -167,4 +191,5 @@ export FOTOKO_E2E_SIM_OUT_STAND_001="$sim/pi/stand-001/out"
 export FOTOKO_E2E_SIM_OUT_STAND_002="$sim/pi/stand-002/out"
 export FOTOKO_E2E_PI_PID_STAND_002="$sim/pids/pi-stand-002.pid"
 ENV
+trap - ERR INT TERM
 echo "sim-up: ready, web $gateway_url (source $sim/env.sh)"

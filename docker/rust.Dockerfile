@@ -6,7 +6,7 @@ ARG RUST_VERSION=1.99
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml clippy.toml ./
+COPY Cargo.toml Cargo.lock rustfmt.toml clippy.toml ./
 COPY crates ./crates
 # The registry and target dir live in cache mounts, so a rebuild only recompiles what changed.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

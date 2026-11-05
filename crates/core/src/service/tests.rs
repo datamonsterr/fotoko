@@ -180,22 +180,31 @@ async fn create_order_rejects_unknown_printer() {
 }
 
 #[tokio::test]
-async fn create_order_requires_online_printer() {
-    for status in [
-        PrinterStatus::Offline,
-        PrinterStatus::Busy,
-        PrinterStatus::Error,
-    ] {
+async fn create_order_requires_a_printer_that_takes_orders() {
+    for status in [PrinterStatus::Offline, PrinterStatus::Error] {
         let h = Harness::new();
         seed_printer(&h, status, 10_000);
         let err = h
             .service
             .create_order(OWNER, &two_photos())
             .await
-            .expect_err("not online");
+            .expect_err("not bookable");
         assert!(matches!(err, CoreError::Validation(_)), "{status:?}");
         assert!(h.orders.all().is_empty());
     }
+}
+
+#[tokio::test]
+async fn create_order_accepts_a_busy_printer() {
+    // A printing Pi queues further jobs, so busy is bookable.
+    let h = Harness::new();
+    seed_printer(&h, PrinterStatus::Busy, 10_000);
+    let created = h
+        .service
+        .create_order(OWNER, &two_photos())
+        .await
+        .expect("busy printer takes orders");
+    assert_eq!(created.status, OrderStatus::AwaitingUpload);
 }
 
 #[tokio::test]

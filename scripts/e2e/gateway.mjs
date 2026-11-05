@@ -7,10 +7,19 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
+import { pipeline } from 'node:stream';
 
 const port = Number(process.env.GATEWAY_PORT);
 const host = process.env.GATEWAY_HOST ?? '127.0.0.1';
-const api = new URL(process.env.API_URL ?? '');
+let api;
+try {
+  api = new URL(process.env.API_URL ?? '');
+} catch {
+  throw new Error('API_URL must be an absolute http(s) URL');
+}
+if (api.protocol !== 'http:' && api.protocol !== 'https:') {
+  throw new Error('API_URL must be an absolute http(s) URL');
+}
 const root = path.resolve(process.env.STATIC_DIR ?? '');
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error('GATEWAY_PORT must be a port number');
@@ -43,14 +52,24 @@ function proxy(req, res) {
     },
     (reply) => {
       res.writeHead(reply.statusCode ?? 502, reply.headers);
-      reply.pipe(res);
+      pipeline(reply, res, () => {});
     },
   );
   upstream.on('error', (error) => {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
     res.writeHead(502, { 'content-type': 'text/plain' });
     res.end(`API unreachable: ${error.message}`);
   });
-  req.pipe(upstream);
+  // A client that goes away takes the upstream request with it.
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      upstream.destroy();
+    }
+  });
+  pipeline(req, upstream, () => {});
 }
 
 async function isFile(file) {
@@ -80,7 +99,7 @@ async function serveStatic(req, res) {
     'content-type': TYPES[path.extname(file)] ?? 'application/octet-stream',
     'cache-control': 'no-store',
   });
-  createReadStream(file).pipe(res);
+  pipeline(createReadStream(file), res, () => {});
 }
 
 http
