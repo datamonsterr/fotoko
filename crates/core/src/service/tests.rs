@@ -583,6 +583,11 @@ struct FaultyRepo {
     flip_to: Arc<Mutex<Option<OrderStatus>>>,
     /// Fail every update with this error.
     update_error: Arc<Mutex<Option<CoreError>>>,
+    /// Before the next update, silently overwrite the stored order with this one.
+    replace_with: Arc<Mutex<Option<Order>>>,
+    /// The next update loses a race, and the order is gone afterwards (reads return `None`).
+    vanish_on_update: Arc<Mutex<bool>>,
+    vanished: Arc<Mutex<bool>>,
 }
 
 impl FaultyRepo {
@@ -591,6 +596,9 @@ impl FaultyRepo {
             inner,
             flip_to: Arc::default(),
             update_error: Arc::default(),
+            replace_with: Arc::default(),
+            vanish_on_update: Arc::default(),
+            vanished: Arc::default(),
         }
     }
 }
@@ -598,6 +606,9 @@ impl FaultyRepo {
 #[async_trait]
 impl OrderRepo for FaultyRepo {
     async fn get(&self, id: &OrderId) -> Result<Option<Order>, CoreError> {
+        if *self.vanished.lock().expect("lock") {
+            return Ok(None);
+        }
         self.inner.get(id).await
     }
     async fn get_by_order_code(&self, code: i64) -> Result<Option<Order>, CoreError> {
@@ -611,6 +622,15 @@ impl OrderRepo for FaultyRepo {
         if let Some(error) = error {
             return Err(error);
         }
+        if std::mem::take(&mut *self.vanish_on_update.lock().expect("lock")) {
+            *self.vanished.lock().expect("lock") = true;
+            return Err(CoreError::Conflict("lost race".into()));
+        }
+        let replacement = self.replace_with.lock().expect("lock").take();
+        if let Some(replacement) = replacement {
+            let before = self.inner.snapshot(&order.order_id).expect("stored").status;
+            self.inner.update(&replacement, before).await?;
+        }
         let flip = self.flip_to.lock().expect("lock").take();
         if let Some(status) = flip {
             let mut current = self.inner.snapshot(&order.order_id).expect("stored");
@@ -620,8 +640,12 @@ impl OrderRepo for FaultyRepo {
         }
         self.inner.update(order, expected).await
     }
-    async fn list_due_for_expiry(&self, now: DateTime<Utc>) -> Result<Vec<Order>, CoreError> {
-        self.inner.list_due_for_expiry(now).await
+    async fn list_due_for_expiry(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Order>, CoreError> {
+        self.inner.list_due_for_expiry(now, limit).await
     }
 }
 
@@ -840,25 +864,24 @@ async fn duplicate_webhook_after_printing_is_a_pure_no_op() {
 }
 
 #[tokio::test]
-async fn webhook_for_cancelled_order_conflicts() {
+async fn webhook_for_cancelled_order_is_a_late_payment() {
     let h = harness();
     let (id, code) = awaiting_payment(&h).await;
     h.service.cancel(OWNER, &id).await.expect("cancel");
-    let err = pay(&h, code, 50_000).await.expect_err("cancelled");
-    assert!(matches!(err, CoreError::Conflict(_)));
+    assert_eq!(pay(&h, code, 50_000).await, Ok(WebhookOutcome::LatePayment));
     assert_eq!(status_of(&h, &id), OrderStatus::Cancelled);
     assert!(h.publisher.jobs().is_empty());
 }
 
 #[tokio::test]
-async fn webhook_for_expired_order_conflicts() {
+async fn webhook_for_expired_order_is_a_late_payment() {
     let h = harness();
     let (id, code) = awaiting_payment(&h).await;
     h.clock.advance(ChronoDuration::minutes(16));
     assert_eq!(h.service.expire_due().await, Ok(1));
-    let err = pay(&h, code, 50_000).await.expect_err("expired");
-    assert!(matches!(err, CoreError::Conflict(_)));
+    assert_eq!(pay(&h, code, 50_000).await, Ok(WebhookOutcome::LatePayment));
     assert_eq!(status_of(&h, &id), OrderStatus::Expired);
+    assert!(h.publisher.jobs().is_empty());
 }
 
 #[tokio::test]
@@ -877,19 +900,121 @@ async fn webhook_publish_failure_is_healed_by_the_retry() {
     assert_eq!(h.publisher.jobs().len(), 1);
 }
 
+async fn race_webhook(
+    h: &Harness,
+    code: i64,
+    repo: &FaultyRepo,
+) -> Result<WebhookOutcome, CoreError> {
+    let webhook = signed_webhook(TEST_CHECKSUM_KEY, "00", code, 50_000).expect("webhook");
+    service_over(h, repo).handle_payos_webhook(&webhook).await
+}
+
 #[tokio::test]
-async fn webhook_race_surfaces_a_conflict() {
+async fn concurrent_duplicate_webhook_that_already_paid_republishes() {
+    let h = harness();
+    let (_, code) = awaiting_payment(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.flip_to.lock().expect("lock") = Some(OrderStatus::Paid);
+    assert_eq!(
+        race_webhook(&h, code, &repo).await,
+        Ok(WebhookOutcome::Duplicate)
+    );
+    assert_eq!(h.publisher.jobs().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_webhook_that_already_progressed_is_a_no_op() {
+    let h = harness();
+    let (_, code) = awaiting_payment(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.flip_to.lock().expect("lock") = Some(OrderStatus::Printing);
+    assert_eq!(
+        race_webhook(&h, code, &repo).await,
+        Ok(WebhookOutcome::Duplicate)
+    );
+    assert!(h.publisher.jobs().is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_cancel_beats_the_webhook() {
     let h = harness();
     let (_, code) = awaiting_payment(&h).await;
     let repo = FaultyRepo::new(h.orders.clone());
     *repo.flip_to.lock().expect("lock") = Some(OrderStatus::Cancelled);
-    let webhook = signed_webhook(TEST_CHECKSUM_KEY, "00", code, 50_000).expect("webhook");
-    let err = service_over(&h, &repo)
-        .handle_payos_webhook(&webhook)
-        .await
-        .expect_err("race");
-    assert!(matches!(err, CoreError::Conflict(_)));
+    assert_eq!(
+        race_webhook(&h, code, &repo).await,
+        Ok(WebhookOutcome::LatePayment)
+    );
     assert!(h.publisher.jobs().is_empty());
+}
+
+#[tokio::test]
+async fn webhook_conflict_without_a_visible_change_surfaces() {
+    let h = harness();
+    let (id, code) = awaiting_payment(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.update_error.lock().expect("lock") = Some(CoreError::Conflict("stale".into()));
+    let err = race_webhook(&h, code, &repo).await.expect_err("conflict");
+    assert!(matches!(err, CoreError::Conflict(_)));
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingPayment);
+}
+
+#[tokio::test]
+async fn concurrent_webhook_on_a_vanished_order_is_not_found() {
+    let h = harness();
+    let (_, code) = awaiting_payment(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.vanish_on_update.lock().expect("lock") = true;
+    let err = race_webhook(&h, code, &repo).await.expect_err("vanished");
+    assert!(matches!(err, CoreError::NotFound(_)));
+}
+
+/// A webhook whose signed `data` carries `signed_code` and whose unsigned envelope says
+/// `outer_code`, with a valid signature over `data`.
+fn webhook_codes(code: i64, signed_code: Option<&str>, outer_code: &str) -> PayosWebhook {
+    let mut webhook = signed_webhook(TEST_CHECKSUM_KEY, "00", code, 50_000).expect("webhook");
+    webhook.data.code = signed_code.map(str::to_owned);
+    webhook.signature =
+        crate::payos::sign_webhook_data(TEST_CHECKSUM_KEY, &webhook.data).expect("sign");
+    webhook.code = outer_code.to_owned();
+    webhook
+}
+
+#[tokio::test]
+async fn payment_result_comes_from_the_signed_data_code() {
+    let h = harness();
+    let (id, code) = awaiting_payment(&h).await;
+    // Valid signature, failed payment inside the signed data, forged "00" outside.
+    let forged = webhook_codes(code, Some("01"), "00");
+    assert_eq!(
+        h.service.handle_payos_webhook(&forged).await,
+        Ok(WebhookOutcome::NotPaid)
+    );
+    // Signed "00" but the unsigned envelope disagrees: not paid either.
+    let mismatch = webhook_codes(code, Some("00"), "01");
+    assert_eq!(
+        h.service.handle_payos_webhook(&mismatch).await,
+        Ok(WebhookOutcome::NotPaid)
+    );
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingPayment);
+    assert!(h.publisher.jobs().is_empty());
+}
+
+#[tokio::test]
+async fn webhook_without_a_signed_code_is_rejected() {
+    let h = harness();
+    let (id, code) = awaiting_payment(&h).await;
+    let missing = webhook_codes(code, None, "00");
+    let err = h
+        .service
+        .handle_payos_webhook(&missing)
+        .await
+        .expect_err("no code");
+    assert_eq!(
+        err,
+        CoreError::Validation("webhook data has no code".into())
+    );
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingPayment);
 }
 
 // ---- job status ----
@@ -1164,13 +1289,161 @@ async fn expire_due_propagates_storage_errors() {
 
 #[test]
 fn config_defaults_and_debug_redaction() {
-    let config = ServiceConfig::new("https://app.test", "super-secret");
+    let config = ServiceConfig::new("https://app.test", "super-secret").expect("config");
+    assert_eq!(config.expire_batch_size, 100);
     assert_eq!(config.order_ttl.as_secs(), 900);
     assert_eq!(config.download_ttl.as_secs(), 900);
     let shown = format!("{config:?}");
     assert!(!shown.contains("super-secret"));
     assert!(shown.contains("<redacted>"));
     assert_eq!(format!("{:?}", harness().service.ports), "Ports { .. }");
+}
+
+#[test]
+fn config_rejects_an_empty_checksum_key() {
+    for key in ["", "   "] {
+        let err = ServiceConfig::new("https://app.test", key).expect_err("empty key");
+        assert!(matches!(err, CoreError::Internal(_)), "{key:?}");
+    }
+}
+
+// ---- checkout race ----
+
+fn checked_out_copy(h: &Harness, id: &OrderId, status: OrderStatus) -> Order {
+    let mut order = h.orders.snapshot(id).expect("stored");
+    order.status = status;
+    order.order_code = Some(5555);
+    order.checkout_url = Some("https://pay.test/5555".into());
+    order.qr_code = Some("qr-5555".into());
+    order
+}
+
+#[tokio::test]
+async fn concurrent_checkout_returns_the_winners_link() {
+    let h = harness();
+    let id = uploaded(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.replace_with.lock().expect("lock") =
+        Some(checked_out_copy(&h, &id, OrderStatus::AwaitingPayment));
+    let res = service_over(&h, &repo)
+        .checkout(OWNER, &id)
+        .await
+        .expect("checkout");
+    assert_eq!(res.order_code, 5555);
+    assert_eq!(res.checkout_url, "https://pay.test/5555");
+    assert_eq!(res.qr_code, "qr-5555");
+    assert_eq!(res.status, OrderStatus::AwaitingPayment);
+}
+
+#[tokio::test]
+async fn checkout_that_lost_to_a_cancel_conflicts() {
+    let h = harness();
+    let id = uploaded(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.replace_with.lock().expect("lock") =
+        Some(checked_out_copy(&h, &id, OrderStatus::Cancelled));
+    let err = service_over(&h, &repo)
+        .checkout(OWNER, &id)
+        .await
+        .expect_err("lost");
+    assert!(matches!(err, CoreError::Conflict(_)));
+}
+
+// ---- job status races ----
+
+#[tokio::test]
+async fn status_race_is_reread_and_reapplied_once() {
+    let h = harness();
+    let id = paid(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.flip_to.lock().expect("lock") = Some(OrderStatus::Printing);
+    // The failure still applies to the re-read `printing` order.
+    let report = job_status(&id, JobState::Failed, None);
+    let outcome = service_over(&h, &repo).handle_job_status(&report).await;
+    assert_eq!(outcome, Ok(StatusOutcome::Applied));
+    assert_eq!(status_of(&h, &id), OrderStatus::Failed);
+}
+
+#[tokio::test]
+async fn status_race_that_makes_the_report_stale_is_ignored() {
+    let h = harness();
+    let id = paid(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.flip_to.lock().expect("lock") = Some(OrderStatus::Printing);
+    let report = job_status(&id, JobState::Printing, None);
+    let outcome = service_over(&h, &repo).handle_job_status(&report).await;
+    assert_eq!(outcome, Ok(StatusOutcome::Ignored));
+    assert_eq!(status_of(&h, &id), OrderStatus::Printing);
+}
+
+#[tokio::test]
+async fn status_race_lost_twice_is_ignored() {
+    let h = harness();
+    let id = paid(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.update_error.lock().expect("lock") = Some(CoreError::Conflict("stale".into()));
+    let report = job_status(&id, JobState::Printing, None);
+    let outcome = service_over(&h, &repo).handle_job_status(&report).await;
+    assert_eq!(outcome, Ok(StatusOutcome::Ignored));
+    assert_eq!(status_of(&h, &id), OrderStatus::Paid);
+}
+
+#[tokio::test]
+async fn status_race_on_a_vanished_order_is_ignored() {
+    let h = harness();
+    let id = paid(&h).await;
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.vanish_on_update.lock().expect("lock") = true;
+    let report = job_status(&id, JobState::Printing, None);
+    let outcome = service_over(&h, &repo).handle_job_status(&report).await;
+    assert_eq!(outcome, Ok(StatusOutcome::Ignored));
+}
+
+// ---- expire_due batching ----
+
+#[tokio::test]
+async fn expire_due_works_through_batches() {
+    let h = harness();
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        ids.push(uploaded(&h).await);
+    }
+    let mut service = h.service.clone();
+    service.config.expire_batch_size = 2;
+    h.clock.advance(ChronoDuration::minutes(16));
+    assert_eq!(service.expire_due().await, Ok(5));
+    assert!(
+        ids.iter()
+            .all(|id| status_of(&h, id) == OrderStatus::Expired)
+    );
+    assert_eq!(service.expire_due().await, Ok(0));
+}
+
+#[tokio::test]
+async fn expire_due_stops_when_a_batch_makes_no_progress() {
+    let h = harness();
+    for _ in 0..2 {
+        uploaded(&h).await;
+    }
+    h.clock.advance(ChronoDuration::minutes(16));
+    let repo = FaultyRepo::new(h.orders.clone());
+    *repo.flip_to.lock().expect("lock") = Some(OrderStatus::Cancelled);
+    let mut service = service_over(&h, &repo);
+    service.config.expire_batch_size = 1;
+    // The first batch loses its only order to a concurrent cancel: the sweep ends, the other
+    // order waits for the next run.
+    assert_eq!(service.expire_due().await, Ok(0));
+    assert_eq!(h.service.expire_due().await, Ok(1));
+}
+
+#[tokio::test]
+async fn expire_due_treats_a_zero_batch_size_as_one() {
+    let h = harness();
+    uploaded(&h).await;
+    h.clock.advance(ChronoDuration::minutes(16));
+    let mut service = h.service.clone();
+    service.config.expire_batch_size = 0;
+    assert_eq!(service.expire_due().await, Ok(1));
 }
 
 // ---- error propagation ----

@@ -66,6 +66,22 @@ impl InMemoryOrderRepo {
         Self::default()
     }
 
+    /// `Conflict` when another order already carries this order's payOS order code.
+    fn check_code_free(orders: &HashMap<OrderId, Order>, order: &Order) -> Result<(), CoreError> {
+        let Some(code) = order.order_code else {
+            return Ok(());
+        };
+        if orders
+            .values()
+            .any(|o| o.order_code == Some(code) && o.order_id != order.order_id)
+        {
+            return Err(CoreError::Conflict(format!(
+                "order code {code} is already taken"
+            )));
+        }
+        Ok(())
+    }
+
     /// Make port method `op` fail with `error`, or work again with `None`.
     pub fn fail_with(&self, op: &'static str, error: Option<CoreError>) {
         self.faults.set(op, error);
@@ -102,6 +118,7 @@ impl OrderRepo for InMemoryOrderRepo {
     async fn insert(&self, order: &Order) -> Result<(), CoreError> {
         self.faults.check("insert")?;
         let mut orders = lock(&self.orders);
+        Self::check_code_free(&orders, order)?;
         if orders.contains_key(&order.order_id) {
             return Err(CoreError::Conflict(format!(
                 "order {} already exists",
@@ -115,6 +132,7 @@ impl OrderRepo for InMemoryOrderRepo {
     async fn update(&self, order: &Order, expected: OrderStatus) -> Result<(), CoreError> {
         self.faults.check("update")?;
         let mut orders = lock(&self.orders);
+        Self::check_code_free(&orders, order)?;
         let Some(stored) = orders.get_mut(&order.order_id) else {
             return Err(CoreError::NotFound(format!(
                 "order {} not found",
@@ -131,7 +149,11 @@ impl OrderRepo for InMemoryOrderRepo {
         Ok(())
     }
 
-    async fn list_due_for_expiry(&self, now: DateTime<Utc>) -> Result<Vec<Order>, CoreError> {
+    async fn list_due_for_expiry(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Order>, CoreError> {
         self.faults.check("list_due_for_expiry")?;
         let mut due: Vec<Order> = lock(&self.orders)
             .values()
@@ -139,6 +161,7 @@ impl OrderRepo for InMemoryOrderRepo {
             .cloned()
             .collect();
         due.sort_by(|a, b| a.order_id.cmp(&b.order_id));
+        due.truncate(limit);
         Ok(due)
     }
 }
@@ -452,8 +475,9 @@ pub fn signed_webhook(
     let data = PayosWebhookData {
         order_code,
         amount,
+        code: Some(code.to_owned()),
+        desc: Some(if code == "00" { "success" } else { "failed" }.to_owned()),
         extra: BTreeMap::from([
-            ("code".to_owned(), serde_json::json!(code)),
             ("currency".to_owned(), serde_json::json!("VND")),
             (
                 "description".to_owned(),
@@ -522,7 +546,7 @@ impl Harness {
                 clock: Arc::new(clock.clone()),
                 ids: Arc::new(ids.clone()),
             },
-            ServiceConfig::new(TEST_APP_URL, TEST_CHECKSUM_KEY),
+            ServiceConfig::unchecked(TEST_APP_URL, TEST_CHECKSUM_KEY),
         );
         Self {
             service,
@@ -631,6 +655,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn order_repo_enforces_unique_order_codes() {
+        let repo = InMemoryOrderRepo::new();
+        let a = order(
+            "a",
+            Some(5),
+            OrderStatus::AwaitingPayment,
+            "2026-01-01T00:15:00Z",
+        );
+        repo.insert(&a).await.expect("insert");
+        let dup = order(
+            "b",
+            Some(5),
+            OrderStatus::AwaitingPayment,
+            "2026-01-01T00:15:00Z",
+        );
+        let err = repo
+            .insert(&dup)
+            .await
+            .expect_err("duplicate code on insert");
+        assert!(matches!(err, CoreError::Conflict(_)));
+
+        let b = order(
+            "b",
+            None,
+            OrderStatus::AwaitingUpload,
+            "2026-01-01T00:15:00Z",
+        );
+        repo.insert(&b).await.expect("insert without code");
+        let mut taken = b.clone();
+        taken.order_code = Some(5);
+        let err = repo
+            .update(&taken, OrderStatus::AwaitingUpload)
+            .await
+            .expect_err("duplicate code on update");
+        assert!(matches!(err, CoreError::Conflict(_)));
+
+        // An order may keep its own code.
+        repo.update(&a, OrderStatus::AwaitingPayment)
+            .await
+            .expect("own code");
+    }
+
+    #[tokio::test]
     async fn order_repo_lists_due_orders_sorted() {
         let repo = InMemoryOrderRepo::new();
         for o in [
@@ -657,11 +724,16 @@ mod tests {
             repo.insert(&o).await.expect("insert");
         }
         let due = repo
-            .list_due_for_expiry(ts("2026-01-01T00:20:00Z"))
+            .list_due_for_expiry(ts("2026-01-01T00:20:00Z"), 10)
             .await
             .expect("list");
         let ids: Vec<_> = due.iter().map(|o| o.order_id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
+        let limited = repo
+            .list_due_for_expiry(ts("2026-01-01T00:20:00Z"), 1)
+            .await
+            .expect("list");
+        assert_eq!(limited.len(), 1);
     }
 
     #[tokio::test]
@@ -868,7 +940,7 @@ mod tests {
             repo.update(&o, OrderStatus::AwaitingUpload).await,
             Err(boom())
         );
-        assert_eq!(repo.list_due_for_expiry(now).await, Err(boom()));
+        assert_eq!(repo.list_due_for_expiry(now, 1).await, Err(boom()));
         for op in [
             "get",
             "get_by_order_code",

@@ -25,7 +25,10 @@ mod tests;
 
 /// How often a taken payOS order code is redrawn before giving up.
 const ORDER_CODE_ATTEMPTS: usize = 5;
-/// payOS limits the payment description to 25 characters.
+/// Default for [`ServiceConfig::expire_batch_size`].
+const EXPIRE_BATCH_SIZE: usize = 100;
+/// payOS limits the payment description to 25 characters. `Fotoko ` plus a valid order code (at
+/// most 16 digits) is 23 characters, so the cap is only a guard against oversized codes.
 const DESCRIPTION_MAX_CHARS: usize = 25;
 /// Presigned GET URLs handed to the Pi stay valid this long.
 const DOWNLOAD_TTL: Duration = Duration::from_secs(15 * 60);
@@ -41,16 +44,38 @@ pub struct ServiceConfig {
     pub order_ttl: Duration,
     /// Validity of the presigned GET URLs in a print job.
     pub download_ttl: Duration,
+    /// How many overdue orders [`OrderService::expire_due`] loads per batch.
+    pub expire_batch_size: usize,
 }
 
 impl ServiceConfig {
     /// Config with the contract defaults: 15 minute order TTL and 15 minute download URLs.
-    pub fn new(public_app_url: impl Into<String>, payos_checksum_key: impl Into<String>) -> Self {
+    /// `Internal` (a configuration error) when the checksum key is empty: an empty key would make
+    /// every webhook signature forgeable.
+    pub fn new(
+        public_app_url: impl Into<String>,
+        payos_checksum_key: impl Into<String>,
+    ) -> Result<Self, CoreError> {
+        let payos_checksum_key = payos_checksum_key.into();
+        if payos_checksum_key.trim().is_empty() {
+            return Err(CoreError::Internal(
+                "payOS checksum key must not be empty".into(),
+            ));
+        }
+        Ok(Self::unchecked(public_app_url, payos_checksum_key))
+    }
+
+    /// [`new`](Self::new) without the key check, for the in-memory test harness.
+    pub(crate) fn unchecked(
+        public_app_url: impl Into<String>,
+        payos_checksum_key: impl Into<String>,
+    ) -> Self {
         Self {
             public_app_url: public_app_url.into(),
             payos_checksum_key: payos_checksum_key.into(),
             order_ttl: ORDER_TTL,
             download_ttl: DOWNLOAD_TTL,
+            expire_batch_size: EXPIRE_BATCH_SIZE,
         }
     }
 }
@@ -62,6 +87,7 @@ impl fmt::Debug for ServiceConfig {
             .field("payos_checksum_key", &"<redacted>")
             .field("order_ttl", &self.order_ttl)
             .field("download_ttl", &self.download_ttl)
+            .field("expire_batch_size", &self.expire_batch_size)
             .finish()
     }
 }
@@ -100,8 +126,14 @@ pub enum WebhookOutcome {
     /// `paid`, the job is published again so a delivery that failed to publish heals on payOS's
     /// retry; the job id is derived from the order id and the Pi dedupes by it.
     Duplicate,
-    /// The webhook reports an unsuccessful payment (`code != "00"`): nothing changed.
+    /// The webhook does not report a successful payment: the signed `data.code` is not `"00"`,
+    /// or the unsigned outer `code` disagrees with it. Nothing changed.
     NotPaid,
+    /// A valid, matching payment arrived for an order that is already `cancelled` or `expired`.
+    /// The customer paid for nothing and needs a manual refund; the order is unchanged. The
+    /// caller acknowledges the webhook (200) so payOS stops retrying, and **must log this at
+    /// warn level** with the order id and code.
+    LatePayment,
 }
 
 /// What a Pi job status did.
@@ -113,11 +145,38 @@ pub enum StatusOutcome {
     Ignored,
 }
 
+/// Result of one try at applying a Pi status report.
+enum Attempt {
+    Applied,
+    Ignored,
+    /// The conditional write lost a race.
+    Raced,
+}
+
 /// The use cases of the Fotoko backend.
 #[derive(Debug, Clone)]
 pub struct OrderService {
     ports: Ports,
     config: ServiceConfig,
+}
+
+/// The checkout response of an order that already has its payment link.
+fn stored_checkout(order: &Order) -> Option<CheckoutResponse> {
+    match (
+        order.status,
+        order.order_code,
+        &order.checkout_url,
+        &order.qr_code,
+    ) {
+        (OrderStatus::AwaitingPayment, Some(code), Some(url), Some(qr)) => Some(CheckoutResponse {
+            order_id: order.order_id.clone(),
+            status: OrderStatus::AwaitingPayment,
+            order_code: code,
+            checkout_url: url.clone(),
+            qr_code: qr.clone(),
+        }),
+        _ => None,
+    }
 }
 
 fn pi_error_code(code: PiErrorCode) -> &'static str {
@@ -247,19 +306,8 @@ impl OrderService {
         let order = self.load_owned(owner, order_id).await?;
         let order = self.expire_if_due(order).await?;
 
-        if let (OrderStatus::AwaitingPayment, Some(code), Some(url), Some(qr)) = (
-            order.status,
-            order.order_code,
-            &order.checkout_url,
-            &order.qr_code,
-        ) {
-            return Ok(CheckoutResponse {
-                order_id: order.order_id.clone(),
-                status: OrderStatus::AwaitingPayment,
-                order_code: code,
-                checkout_url: url.clone(),
-                qr_code: qr.clone(),
-            });
+        if let Some(stored) = stored_checkout(&order) {
+            return Ok(stored);
         }
 
         let now = self.ports.clock.now();
@@ -300,7 +348,18 @@ impl OrderService {
         next.order_code = Some(order_code);
         next.checkout_url = Some(link.checkout_url.clone());
         next.qr_code = Some(link.qr_code.clone());
-        self.ports.orders.update(&next, order.status).await?;
+        match self.ports.orders.update(&next, order.status).await {
+            Ok(()) => {}
+            Err(CoreError::Conflict(_)) => {
+                // A concurrent checkout won. Its link is the order's link; ours stays unused at
+                // payOS and lapses with `expires_at`.
+                let fresh = self.load(order_id).await?;
+                return stored_checkout(&fresh).ok_or_else(|| {
+                    CoreError::Conflict(format!("order {order_id} changed during checkout"))
+                });
+            }
+            Err(error) => return Err(error),
+        }
 
         Ok(CheckoutResponse {
             order_id: next.order_id,
@@ -344,11 +403,17 @@ impl OrderService {
 
     /// `POST /v1/payments/payos/webhook`.
     ///
-    /// Verifies the signature (`Validation` when bad), finds the order by order code
-    /// (`NotFound`), and for `code == "00"` checks the amount (`Validation` on mismatch, order
-    /// unchanged), moves `awaiting_payment` to `paid` and publishes the print job with 15 minute
-    /// presigned GET URLs. Repeat deliveries succeed without changing the order. A payment for a
-    /// cancelled or expired order is a `Conflict`.
+    /// 1. Verifies the signature (`Validation` when bad). The signature covers only `data`, so
+    ///    the payment result is read from the signed `data.code` (`Validation` when absent). The
+    ///    unsigned outer `code` is only a consistency check: if it disagrees, nothing is paid.
+    /// 2. Finds the order by order code (`NotFound`).
+    /// 3. `data.code != "00"` or an inconsistent outer code: [`WebhookOutcome::NotPaid`].
+    /// 4. The amount must equal the order's (`Validation`, order unchanged).
+    /// 5. `awaiting_payment` moves to `paid` and the print job is published with presigned GET
+    ///    URLs. A repeat delivery succeeds without changing the order; while the order is still
+    ///    `paid` it republishes the job. A lost race against a concurrent delivery is re-read and
+    ///    treated the same way. Cancelled or expired orders give
+    ///    [`WebhookOutcome::LatePayment`]; an `awaiting_upload` order is a `Conflict`.
     pub async fn handle_payos_webhook(
         &self,
         webhook: &PayosWebhook,
@@ -356,6 +421,9 @@ impl OrderService {
         if !payos::verify_webhook(&self.config.payos_checksum_key, webhook) {
             return Err(CoreError::Validation("invalid webhook signature".into()));
         }
+        let Some(signed_code) = webhook.data.code.as_deref() else {
+            return Err(CoreError::Validation("webhook data has no code".into()));
+        };
         let order_code = webhook.data.order_code;
         let order = self
             .ports
@@ -364,7 +432,7 @@ impl OrderService {
             .await?
             .ok_or_else(|| CoreError::NotFound(format!("no order for code {order_code}")))?;
 
-        if webhook.code != "00" {
+        if signed_code != "00" || webhook.code != "00" {
             return Ok(WebhookOutcome::NotPaid);
         }
         if webhook.data.amount != order.amount_vnd {
@@ -374,20 +442,39 @@ impl OrderService {
             )));
         }
 
+        if let Some(outcome) = self.already_settled(&order).await? {
+            return Ok(outcome);
+        }
+        let paid = order.advance(OrderEvent::PaymentConfirmed, self.ports.clock.now())?;
+        match self.ports.orders.update(&paid, order.status).await {
+            Ok(()) => {}
+            Err(CoreError::Conflict(_)) => {
+                let fresh = self.load(&order.order_id).await?;
+                return self.already_settled(&fresh).await?.ok_or_else(|| {
+                    CoreError::Conflict(format!("order {} changed during payment", order.order_id))
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        self.publish_job(&paid).await?;
+        Ok(WebhookOutcome::Paid)
+    }
+
+    /// Outcome of a valid payment for an order that is not `awaiting_payment`; `None` when it is.
+    async fn already_settled(&self, order: &Order) -> Result<Option<WebhookOutcome>, CoreError> {
         match order.status {
+            OrderStatus::AwaitingPayment => Ok(None),
             OrderStatus::Paid => {
-                self.publish_job(&order).await?;
-                Ok(WebhookOutcome::Duplicate)
+                self.publish_job(order).await?;
+                Ok(Some(WebhookOutcome::Duplicate))
             }
             OrderStatus::Printing | OrderStatus::Completed | OrderStatus::Failed => {
-                Ok(WebhookOutcome::Duplicate)
+                Ok(Some(WebhookOutcome::Duplicate))
             }
-            _ => {
-                let paid = order.advance(OrderEvent::PaymentConfirmed, self.ports.clock.now())?;
-                self.ports.orders.update(&paid, order.status).await?;
-                self.publish_job(&paid).await?;
-                Ok(WebhookOutcome::Paid)
-            }
+            OrderStatus::Cancelled | OrderStatus::Expired => Ok(Some(WebhookOutcome::LatePayment)),
+            OrderStatus::AwaitingUpload => Err(CoreError::Conflict(
+                "order is awaiting_upload: payment not allowed".into(),
+            )),
         }
     }
 
@@ -396,11 +483,33 @@ impl OrderService {
     /// `received` and `printing` move `paid` to `printing`, `completed` moves to `completed`
     /// (through `printing` when the `received` report was lost) and `failed` moves `paid` or
     /// `printing` to `failed` with the Pi's error. Unknown orders and stale or repeated reports
-    /// are ignored. A report from another printer than the order's is `Forbidden`.
+    /// are ignored. A report from another printer than the order's is `Forbidden`. When the
+    /// conditional write loses a race, the order is re-read and the report applied once more;
+    /// a second loss, or a report that no longer applies, is ignored.
     pub async fn handle_job_status(&self, status: &JobStatus) -> Result<StatusOutcome, CoreError> {
         let Some(order) = self.ports.orders.get(&status.order_id).await? else {
             return Ok(StatusOutcome::Ignored);
         };
+        match self.try_apply_status(&order, status).await? {
+            Attempt::Applied => Ok(StatusOutcome::Applied),
+            Attempt::Ignored => Ok(StatusOutcome::Ignored),
+            Attempt::Raced => {
+                let Some(fresh) = self.ports.orders.get(&status.order_id).await? else {
+                    return Ok(StatusOutcome::Ignored);
+                };
+                match self.try_apply_status(&fresh, status).await? {
+                    Attempt::Applied => Ok(StatusOutcome::Applied),
+                    Attempt::Ignored | Attempt::Raced => Ok(StatusOutcome::Ignored),
+                }
+            }
+        }
+    }
+
+    async fn try_apply_status(
+        &self,
+        order: &Order,
+        status: &JobStatus,
+    ) -> Result<Attempt, CoreError> {
         if order.printer_id != status.printer_id {
             return Err(CoreError::Forbidden(format!(
                 "printer {} does not own order {}",
@@ -419,7 +528,7 @@ impl OrderService {
             (JobState::Failed, OrderStatus::Paid | OrderStatus::Printing) => {
                 &[OrderEvent::JobFailed]
             }
-            _ => return Ok(StatusOutcome::Ignored),
+            _ => return Ok(Attempt::Ignored),
         };
 
         let now = self.ports.clock.now();
@@ -439,8 +548,11 @@ impl OrderService {
                 },
             });
         }
-        self.ports.orders.update(&next, order.status).await?;
-        Ok(StatusOutcome::Applied)
+        match self.ports.orders.update(&next, order.status).await {
+            Ok(()) => Ok(Attempt::Applied),
+            Err(CoreError::Conflict(_)) => Ok(Attempt::Raced),
+            Err(error) => Err(error),
+        }
     }
 
     /// Pi heartbeat: sets the printer's status and `lastSeenAt` (server time). `NotFound` for
@@ -456,20 +568,37 @@ impl OrderService {
             .await
     }
 
-    /// Expire every unpaid order past its `expiresAt`. Returns how many orders this call
-    /// expired; orders that changed concurrently are skipped.
+    /// Expire every unpaid order past its `expiresAt`, in batches of
+    /// [`ServiceConfig::expire_batch_size`] until none are left. Returns how many orders this
+    /// call expired. Orders that changed concurrently are skipped; a batch in which nothing could
+    /// be expired ends the sweep, which the next run resumes.
     pub async fn expire_due(&self) -> Result<usize, CoreError> {
         let now = self.ports.clock.now();
-        let mut expired = 0;
-        for order in self.ports.orders.list_due_for_expiry(now).await? {
-            let next = order.advance(OrderEvent::Expire, now)?;
-            match self.ports.orders.update(&next, order.status).await {
-                Ok(()) => expired += 1,
-                Err(CoreError::Conflict(_)) => {}
-                Err(error) => return Err(error),
+        let batch_size = self.config.expire_batch_size.max(1);
+        let mut total = 0;
+        loop {
+            let due = self
+                .ports
+                .orders
+                .list_due_for_expiry(now, batch_size)
+                .await?;
+            if due.is_empty() {
+                return Ok(total);
             }
+            let mut expired = 0;
+            for order in due {
+                let next = order.advance(OrderEvent::Expire, now)?;
+                match self.ports.orders.update(&next, order.status).await {
+                    Ok(()) => expired += 1,
+                    Err(CoreError::Conflict(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if expired == 0 {
+                return Ok(total);
+            }
+            total += expired;
         }
-        Ok(expired)
     }
 
     async fn load_owned(&self, owner: &str, order_id: &OrderId) -> Result<Order, CoreError> {

@@ -272,6 +272,13 @@ pub struct PayosWebhookData {
     pub order_code: i64,
     /// Paid amount in VND.
     pub amount: u64,
+    /// Payment result inside the signed data: `"00"` means paid. The outer
+    /// [`PayosWebhook::code`] is not covered by the signature, so decisions must use this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Result description inside the signed data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
     /// Remaining payOS fields.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -280,9 +287,9 @@ pub struct PayosWebhookData {
 /// `POST /v1/payments/payos/webhook` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayosWebhook {
-    /// `"00"` means paid.
+    /// `"00"` means paid. Not covered by the signature: see [`PayosWebhookData::code`].
     pub code: String,
-    /// Description.
+    /// Description (not covered by the signature).
     pub desc: String,
     /// Success flag.
     pub success: bool,
@@ -543,6 +550,8 @@ mod tests {
             data: PayosWebhookData {
                 order_code: 42,
                 amount: 10_000,
+                code: None,
+                desc: None,
                 extra: BTreeMap::from([
                     ("currency".to_owned(), json!("VND")),
                     ("paymentLinkId".to_owned(), json!("abc")),
@@ -557,5 +566,26 @@ mod tests {
                             "paymentLinkId": "abc"},
                    "signature": "deadbeef"}),
         );
+    }
+
+    #[test]
+    fn payos_webhook_data_types_code_and_desc() {
+        let data = PayosWebhookData {
+            order_code: 42,
+            amount: 10_000,
+            code: Some("00".into()),
+            desc: Some("Thành công".into()),
+            extra: BTreeMap::from([("currency".to_owned(), json!("VND"))]),
+        };
+        check(
+            &data,
+            json!({"orderCode": 42, "amount": 10000, "code": "00", "desc": "Thành công",
+                   "currency": "VND"}),
+        );
+        // Without them the wire format is unchanged and they stay absent.
+        let bare: PayosWebhookData =
+            serde_json::from_value(json!({"orderCode": 1, "amount": 2})).expect("deserialize");
+        assert_eq!((bare.code, bare.desc), (None, None));
+        assert!(bare.extra.is_empty());
     }
 }

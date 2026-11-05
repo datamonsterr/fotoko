@@ -27,15 +27,28 @@ pub trait OrderRepo: Send + Sync {
     /// The order that carries this payOS order code, or `None`.
     async fn get_by_order_code(&self, order_code: i64) -> Result<Option<Order>, CoreError>;
 
-    /// Store a new order. `Conflict` when the id already exists.
+    /// Store a new order. `Conflict` when the id already exists, or when `order_code` is set and
+    /// another order already carries it.
     async fn insert(&self, order: &Order) -> Result<(), CoreError>;
 
     /// Replace the order if its stored status is still `expected` (conditional write).
-    /// `Conflict` when the stored status differs, `NotFound` when the order does not exist.
+    /// `Conflict` when the stored status differs, or when the update sets an `order_code` that
+    /// another order already carries; `NotFound` when the order does not exist.
+    ///
+    /// Order codes must be unique across orders. [`IdGen::order_code`] plus a
+    /// `get_by_order_code` probe is only a best-effort check with a race window, so adapters
+    /// must enforce uniqueness atomically, for example with a DynamoDB transaction that also
+    /// writes a reservation item `ORDERCODE#{code}` guarded by `attribute_not_exists`.
     async fn update(&self, order: &Order, expected: OrderStatus) -> Result<(), CoreError>;
 
-    /// Unpaid orders (`awaiting_upload`, `awaiting_payment`) with `expires_at < now`.
-    async fn list_due_for_expiry(&self, now: DateTime<Utc>) -> Result<Vec<Order>, CoreError>;
+    /// At most `limit` unpaid orders (`awaiting_upload`, `awaiting_payment`) with
+    /// `expires_at < now`. The service calls it repeatedly until it returns nothing. Adapters
+    /// should query an index (a GSI on status and `expires_at`), not scan the table.
+    async fn list_due_for_expiry(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Order>, CoreError>;
 }
 
 /// Persistence of printers.
@@ -160,7 +173,8 @@ pub trait IdGen: Send + Sync {
     /// A fresh photo id.
     fn photo_id(&self) -> PhotoId;
     /// A fresh candidate payOS order code: positive and at most 2^53 - 1 (payOS limit).
-    /// The service retries when the code is already taken.
+    /// Not guaranteed unique: the service probes `OrderRepo::get_by_order_code` and redraws,
+    /// and the repo must reject duplicates atomically (see [`OrderRepo::update`]).
     fn order_code(&self) -> i64;
 }
 
