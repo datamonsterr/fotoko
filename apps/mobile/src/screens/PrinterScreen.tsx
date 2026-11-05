@@ -58,7 +58,8 @@ export function PrinterScreen({ printerId }: { printerId: string }) {
   }
 
   const { printer } = state;
-  const online = printer.status === 'online';
+  // A busy printer is still printing: jobs queue on the Pi, so orders are accepted.
+  const bookable = printer.status === 'online' || printer.status === 'busy';
   return (
     <Screen testID="printer-screen">
       <Text
@@ -79,12 +80,12 @@ export function PrinterScreen({ printerId }: { printerId: string }) {
       </View>
       <Text
         testID="printer-status"
-        accessibilityRole={online ? 'text' : 'alert'}
-        style={online ? styles.ok : styles.error}
+        accessibilityRole={bookable ? 'text' : 'alert'}
+        style={bookable ? styles.ok : styles.error}
       >
         {t(`printer.status.${printer.status}`)}
       </Text>
-      {online ? (
+      {bookable ? (
         <Button
           label={t('printer.pick')}
           testID="printer-pick-button"
