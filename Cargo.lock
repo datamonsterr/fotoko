@@ -1427,6 +1427,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "fotoko-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "chrono",
+ "fotoko-api",
+ "fotoko-core",
+ "fotoko-pi-agent",
+ "fotoko-printer-sim",
+ "fotoko-protocol",
+ "image",
+ "reqwest",
+ "rumqttc",
+ "rumqttd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "fotoko-pi-agent"
 version = "0.1.0"
 dependencies = [
@@ -2929,6 +2953,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

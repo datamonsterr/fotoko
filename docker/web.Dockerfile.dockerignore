@@ -1,0 +1,11 @@
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!apps/mobile/**
+!packages/e2e-web/package.json
+!infra/cdk/package.json
+!scripts/e2e/gateway.mjs
+**/node_modules
+**/dist
+**/.expo
