@@ -26,15 +26,15 @@ Auth: API Gateway IAM auth with Cognito identity pool guest credentials (SigV4).
 
 Errors: `{"error":{"code":"<snake_case>","message":"..."}}`. Codes: `not_found`, `validation`, `forbidden`, `conflict`, `payment_provider`, `internal`.
 
-| Method + path | Request | Response |
-| --- | --- | --- |
-| `GET /healthz` | - | `200 {"ok":true}` |
-| `GET /v1/printers/{printerId}` | - | `200 {printerId,name,status:"online"\|"offline"\|"busy"\|"error",pricePerPrintVnd,media:["4x6"]}` |
-| `POST /v1/orders` | `{printerId, photos:[{contentType:"image/jpeg"\|"image/png", sizeBytes, copies}]}` | `201 {orderId,status:"awaiting_upload",amountVnd,expiresAt,uploads:[{photoId,url,method:"PUT",headers:{},expiresAt}]}` |
-| `GET /v1/orders/{orderId}` | - | `200 Order` (owner only) |
-| `POST /v1/orders/{orderId}/checkout` | - | `200 {orderId,status:"awaiting_payment",orderCode,checkoutUrl,qrCode}`; fails `conflict` if a photo is not uploaded |
-| `POST /v1/orders/{orderId}/cancel` | - | `200 Order`; only before `paid` |
-| `POST /v1/payments/payos/webhook` | payOS webhook body | `200 {"success":true}`; bad signature -> `400 validation` |
+| Method + path                        | Request                                                                            | Response                                                                                                               |
+| ------------------------------------ | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `GET /healthz`                       | -                                                                                  | `200 {"ok":true}`                                                                                                      |
+| `GET /v1/printers/{printerId}`       | -                                                                                  | `200 {printerId,name,status:"online"\|"offline"\|"busy"\|"error",pricePerPrintVnd,media:["4x6"]}`                      |
+| `POST /v1/orders`                    | `{printerId, photos:[{contentType:"image/jpeg"\|"image/png", sizeBytes, copies}]}` | `201 {orderId,status:"awaiting_upload",amountVnd,expiresAt,uploads:[{photoId,url,method:"PUT",headers:{},expiresAt}]}` |
+| `GET /v1/orders/{orderId}`           | -                                                                                  | `200 Order` (owner only)                                                                                               |
+| `POST /v1/orders/{orderId}/checkout` | -                                                                                  | `200 {orderId,status:"awaiting_payment",orderCode,checkoutUrl,qrCode}`; fails `conflict` if a photo is not uploaded    |
+| `POST /v1/orders/{orderId}/cancel`   | -                                                                                  | `200 Order`; only before `paid`                                                                                        |
+| `POST /v1/payments/payos/webhook`    | payOS webhook body                                                                 | `200 {"success":true}`; bad signature -> `400 validation`                                                              |
 
 Validation: 1..=10 photos, copies 1..=5 each, sizeBytes 1..=15 MiB, printer must be `online`. `amountVnd = sum(copies) * pricePerPrintVnd`. Order expires 15 min after creation unless paid. Webhook is idempotent (repeat delivery of a paid order is a no-op returning success).
 
@@ -54,6 +54,7 @@ Any other transition is rejected with `conflict`.
 ## payOS
 
 Check current docs before coding (payos.vn docs, `payOSHQ` SDKs). Expected:
+
 - Create link: `POST {PAYOS_BASE_URL}/v2/payment-requests`, headers `x-client-id`, `x-api-key`; body `orderCode, amount, description (<=25 chars), cancelUrl, returnUrl, signature`. `signature = HMAC_SHA256(checksumKey, "amount=..&cancelUrl=..&description=..&orderCode=..&returnUrl=..")` hex.
 - Webhook: `{code, desc, success, data:{orderCode, amount, ...}, signature}`; `signature = HMAC_SHA256(checksumKey, data keys sorted alphabetically joined as k=v&...)`. `code == "00"` means paid. Amount must equal order amount.
 - `returnUrl`/`cancelUrl`: `{PUBLIC_APP_URL}/orders/{orderId}`.
@@ -62,11 +63,11 @@ Check current docs before coding (payos.vn docs, `payOSHQ` SDKs). Expected:
 
 Thing name = `printerId`. QoS 1. JSON, camelCase.
 
-| Topic | Direction | Payload |
-| --- | --- | --- |
-| `fotoko/printers/{printerId}/jobs` | cloud -> Pi | `PrintJob {jobId, orderId, printerId, media:"4x6", createdAt, photos:[{photoId, url, contentType, copies}]}` (url = presigned GET, 15 min) |
-| `fotoko/printers/{printerId}/status` | Pi -> cloud | `JobStatus {jobId, orderId, printerId, state:"received"\|"printing"\|"completed"\|"failed", printedCopies, error?:{code,message}, at}` |
-| `fotoko/printers/{printerId}/heartbeat` | Pi -> cloud | `Heartbeat {printerId, printerState:"idle"\|"printing"\|"error"\|"offline", agentVersion, at}`; also the MQTT last will with `offline` |
+| Topic                                   | Direction   | Payload                                                                                                                                    |
+| --------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `fotoko/printers/{printerId}/jobs`      | cloud -> Pi | `PrintJob {jobId, orderId, printerId, media:"4x6", createdAt, photos:[{photoId, url, contentType, copies}]}` (url = presigned GET, 15 min) |
+| `fotoko/printers/{printerId}/status`    | Pi -> cloud | `JobStatus {jobId, orderId, printerId, state:"received"\|"printing"\|"completed"\|"failed", printedCopies, error?:{code,message}, at}`     |
+| `fotoko/printers/{printerId}/heartbeat` | Pi -> cloud | `Heartbeat {printerId, printerState:"idle"\|"printing"\|"error"\|"offline", agentVersion, at}`; also the MQTT last will with `offline`     |
 
 Pi error codes: `paper_out`, `ribbon_out`, `printer_offline`, `download_failed`, `invalid_image`, `driver_error`.
 Pi rules: reject jobs whose `printerId` != own id; dedupe by `jobId` (persisted file); download only `https` URLs (allow `http` when `allow_insecure_http = true` for sim); max 15 MiB per image; validate magic bytes match `contentType`.
@@ -75,10 +76,10 @@ Status mapping (cloud): `received|printing` -> order `printing`; `completed` -> 
 
 ## DynamoDB (single table, `TABLE_NAME`)
 
-| Item | pk | sk | attrs |
-| --- | --- | --- | --- |
-| Printer | `PRINTER#{printerId}` | `META` | name, pricePerPrintVnd, status, lastSeenAt |
-| Order | `ORDER#{orderId}` | `META` | printerId, owner, status, amountVnd, orderCode, photos, createdAt, updatedAt, expiresAt, ttl, gsi1pk=`ORDERCODE#{orderCode}` |
+| Item    | pk                    | sk     | attrs                                                                                                                        |
+| ------- | --------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| Printer | `PRINTER#{printerId}` | `META` | name, pricePerPrintVnd, status, lastSeenAt                                                                                   |
+| Order   | `ORDER#{orderId}`     | `META` | printerId, owner, status, amountVnd, orderCode, photos, createdAt, updatedAt, expiresAt, ttl, gsi1pk=`ORDERCODE#{orderCode}` |
 
 GSI `gsi1` on `gsi1pk` (webhook lookup). Status updates use conditional writes on the expected current status.
 
@@ -86,11 +87,11 @@ S3 (`BUCKET_NAME`): `orders/{orderId}/{photoId}.{jpg|png}`. Lifecycle: delete af
 
 ## Lambda binaries (`crates/api`)
 
-| bin | trigger | build output |
-| --- | --- | --- |
-| `fotoko-http` | API Gateway HTTP API | `target/lambda/fotoko-http/bootstrap` |
+| bin                 | trigger                                                                                    | build output                                |
+| ------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------- |
+| `fotoko-http`       | API Gateway HTTP API                                                                       | `target/lambda/fotoko-http/bootstrap`       |
 | `fotoko-iot-status` | IoT rule `SELECT *, topic(3) AS printerId FROM 'fotoko/printers/+/+'` (status + heartbeat) | `target/lambda/fotoko-iot-status/bootstrap` |
-| `fotoko-local` | local dev / e2e server (not deployed) | cargo bin |
+| `fotoko-local`      | local dev / e2e server (not deployed)                                                      | cargo bin                                   |
 
 Built with `cargo lambda build --release --arm64`. CDK reads `FOTOKO_LAMBDA_DIR` (default `<repo>/target/lambda`).
 
