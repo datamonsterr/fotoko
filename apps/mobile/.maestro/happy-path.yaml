@@ -1,0 +1,47 @@
+# Happy path against the local stack (fotoko-local + payOS mock + Pi agent + printer sim).
+# Not run in CI. Needs: EXPO_PUBLIC_FOTOKO_MODE=local, a dev build, printer "stand-001" online,
+# and at least one photo in the device gallery. Run: maestro test apps/mobile/.maestro/happy-path.yaml
+appId: vn.fotoko.app
+---
+- launchApp:
+    clearState: true
+- openLink: fotoko://p/stand-001
+- extendedWaitUntil:
+    visible:
+      id: printer-name
+    timeout: 15000
+- assertVisible:
+    id: printer-price
+- tapOn:
+    id: printer-pick-button
+- tapOn:
+    id: picker-add
+# System photo picker: choose the first photo (picker UI differs per OS version).
+- runFlow: subflows/pick-first-photo.yaml
+- assertVisible:
+    id: picker-photo-0
+- tapOn:
+    id: picker-copies-inc-0
+- assertVisible:
+    id: picker-copies-0
+    text: 'Số bản in: 2'
+- assertVisible:
+    id: picker-total
+    text: '20.000 ₫'
+- tapOn:
+    id: picker-continue
+# Upload finishes, checkout opens the payOS page in the in-app browser. The payOS mock confirms
+# the payment on its own; close the browser to land on the order screen.
+- extendedWaitUntil:
+    visible:
+      id: upload-phase
+    timeout: 15000
+- extendedWaitUntil:
+    visible:
+      id: order-screen
+    timeout: 60000
+- extendedWaitUntil:
+    visible:
+      id: order-done
+    timeout: 120000
+- assertVisible: 'Đã in xong!'

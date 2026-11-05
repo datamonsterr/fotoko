@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test fixture standing in for the cargo-lambda bootstrap binary.
+exit 0
