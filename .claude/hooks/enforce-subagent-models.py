@@ -49,7 +49,10 @@ def decide(raw: str):
 
 
 def main() -> None:
-    reason = decide(sys.stdin.read())
+    try:
+        reason = decide(sys.stdin.read())
+    except BaseException as exc:  # fail closed on anything, including RecursionError
+        reason = f"Hook failed ({type(exc).__name__}); denying subagent call."
     if reason is not None:
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",

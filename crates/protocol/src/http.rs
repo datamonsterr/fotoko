@@ -302,6 +302,7 @@ pub struct WebhookAck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::tests::pid;
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
 
@@ -364,6 +365,7 @@ mod tests {
             (ErrorCode::Conflict, "conflict"),
             (ErrorCode::PaymentProvider, "payment_provider"),
             (ErrorCode::Internal, "internal"),
+            (ErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in all {
             check(&code, json!(wire));
@@ -400,7 +402,7 @@ mod tests {
     #[test]
     fn printer_info() {
         let info = PrinterInfo {
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             name: "Stand 1".into(),
             status: PrinterStatus::Online,
             price_per_print_vnd: 10_000,
@@ -416,7 +418,7 @@ mod tests {
     #[test]
     fn create_order_request() {
         let req = CreateOrderRequest {
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             photos: vec![PhotoSpec {
                 content_type: ContentType::Jpeg,
                 size_bytes: 1234,
@@ -463,7 +465,7 @@ mod tests {
     fn sample_order() -> Order {
         Order {
             order_id: "o1".into(),
-            printer_id: "stand-001".into(),
+            printer_id: pid("stand-001"),
             status: OrderStatus::Paid,
             amount_vnd: 10_000,
             order_code: Some(123),
