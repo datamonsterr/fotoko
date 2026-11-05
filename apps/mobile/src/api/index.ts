@@ -10,7 +10,7 @@ let instance: ApiClient | undefined;
  */
 export function getApiClient(): ApiClient {
   instance ??= createApiClient({
-    baseUrl: process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000',
+    baseUrl: process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8787',
     auth: createAuthFromEnv({
       EXPO_PUBLIC_FOTOKO_MODE: process.env.EXPO_PUBLIC_FOTOKO_MODE,
       EXPO_PUBLIC_AWS_REGION: process.env.EXPO_PUBLIC_AWS_REGION,

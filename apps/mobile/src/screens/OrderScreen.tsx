@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
 
@@ -13,6 +13,7 @@ import { useOrderPolling } from '@/hooks/useOrderPolling';
 import { useI18n } from '@/i18n';
 import { formatVnd } from '@/lib/price';
 import { canCancel } from '@/lib/status';
+import { usePhotoDraft } from '@/state/draft';
 
 export function OrderScreen({
   orderId,
@@ -29,8 +30,17 @@ export function OrderScreen({
     client,
     intervalMs,
   });
+  const { dispatch } = usePhotoDraft();
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<unknown>(null);
+
+  // Once the order is past upload the photos are on the server; a failed payOS load keeps them.
+  const loadedStatus = order?.status;
+  useEffect(() => {
+    if (loadedStatus && loadedStatus !== 'awaiting_upload') {
+      dispatch({ type: 'clear' });
+    }
+  }, [loadedStatus, dispatch]);
 
   const cancel = async () => {
     setCancelling(true);

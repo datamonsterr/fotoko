@@ -23,7 +23,7 @@ Maestro flows are in `.maestro/` and are not run in CI. Test IDs: `TESTIDS.md`.
 
 | Variable                               | Meaning                                                     |
 | -------------------------------------- | ----------------------------------------------------------- |
-| `EXPO_PUBLIC_API_URL`                  | Backend base URL (default `http://localhost:3000`)          |
+| `EXPO_PUBLIC_API_URL`                  | Backend base URL (default `http://localhost:8787`)          |
 | `EXPO_PUBLIC_FOTOKO_MODE`              | `local` (identity header) or `aws` (default, Cognito+SigV4) |
 | `EXPO_PUBLIC_AWS_REGION`               | aws mode: region of the identity pool and API Gateway       |
 | `EXPO_PUBLIC_COGNITO_IDENTITY_POOL_ID` | aws mode: identity pool with guest access                   |

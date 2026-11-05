@@ -1,8 +1,10 @@
+import { Text } from 'react-native';
 import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { ApiError, type ApiClient, type Order, type OrderStatus } from '@/api';
 import { order } from '@/test/fixtures';
-import { renderApp, router } from '@/test/render';
+import { usePhotoDraft } from '@/state/draft';
+import { draftPhoto, renderApp, router } from '@/test/render';
 
 import { OrderScreen } from './OrderScreen';
 
@@ -242,5 +244,57 @@ describe('OrderScreen', () => {
     expect(screen.getByTestId('order-status')).toHaveTextContent(
       'Đã thanh toán',
     );
+  });
+
+  describe('draft', () => {
+    const Probe = () => {
+      const { photos } = usePhotoDraft();
+      return <Text testID="draft-count">{String(photos.length)}</Text>;
+    };
+    const renderWith = async (status: OrderStatus) => {
+      const getOrder = jest.fn().mockResolvedValue(at(status));
+      await renderApp(
+        <>
+          <OrderScreen orderId="ord-1" client={clientWith({ getOrder })} />
+          <Probe />
+        </>,
+        { photos: [draftPhoto(0), draftPhoto(1)] },
+      );
+    };
+
+    it.each(['awaiting_payment', 'paid', 'completed', 'cancelled'] as const)(
+      'is cleared once the order is %s',
+      async (status) => {
+        await renderWith(status);
+        await waitFor(() =>
+          expect(screen.getByTestId('draft-count')).toHaveTextContent('0'),
+        );
+      },
+    );
+
+    it('is kept while the order is still awaiting_upload', async () => {
+      await renderWith('awaiting_upload');
+      await waitFor(() =>
+        expect(screen.getByTestId('order-status')).toBeOnTheScreen(),
+      );
+      expect(screen.getByTestId('draft-count')).toHaveTextContent('2');
+    });
+
+    it('is kept when the order cannot be loaded', async () => {
+      const getOrder = jest
+        .fn()
+        .mockRejectedValue(new ApiError('not_found', 'x', 404));
+      await renderApp(
+        <>
+          <OrderScreen orderId="x" client={clientWith({ getOrder })} />
+          <Probe />
+        </>,
+        { photos: [draftPhoto(0)] },
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId('order-error')).toBeOnTheScreen(),
+      );
+      expect(screen.getByTestId('draft-count')).toHaveTextContent('1');
+    });
   });
 });
