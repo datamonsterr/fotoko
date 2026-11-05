@@ -1,5 +1,11 @@
 import { useEffect } from 'react';
-import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Platform,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { useRouter } from 'expo-router';
 
 import type { ApiClient } from '@/api';
@@ -26,13 +32,14 @@ export function UploadScreen({
 }) {
   const { t } = useI18n();
   const router = useRouter();
-  const { photos: draft, dispatch } = usePhotoDraft();
+  const { photos: draft } = usePhotoDraft();
   const flow = useCheckoutFlow(printerId, draft, {
     client,
     upload,
     onCheckout: async (url, orderId) => {
       await openCheckout(url);
-      dispatch({ type: 'clear' });
+      // Web leaves the page: payOS returns to /orders/{id}, and the order screen clears the draft.
+      if (Platform.OS === 'web') return;
       router.replace({ pathname: '/orders/[orderId]', params: { orderId } });
     },
   });

@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { ApiError, type ApiClient } from '@/api';
@@ -196,5 +197,36 @@ describe('UploadScreen', () => {
         'https://pay.example/c',
       ),
     );
+  });
+
+  describe('web', () => {
+    const original = Platform.OS;
+    beforeEach(() => {
+      Platform.OS = 'web';
+    });
+    afterEach(() => {
+      Platform.OS = original;
+    });
+
+    it('opens payOS and stays: no router.replace (payOS returnUrl brings the user back)', async () => {
+      const s = setup(1);
+      await renderApp(s.ui, { photos: s.photos });
+      await waitFor(() =>
+        expect(s.openCheckout).toHaveBeenCalledWith('https://pay.example/c'),
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId('upload-phase')).toHaveTextContent(
+          'Đang mở trang thanh toán...',
+        ),
+      );
+      expect(router.replace).not.toHaveBeenCalled();
+    });
+  });
+
+  it('native: the draft is not cleared by the upload screen itself', async () => {
+    const s = setup(1);
+    await renderApp(s.ui, { photos: s.photos });
+    await waitFor(() => expect(router.replace).toHaveBeenCalled());
+    expect(screen.getByTestId('upload-photo-0')).toBeOnTheScreen();
   });
 });
