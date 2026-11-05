@@ -1,0 +1,30 @@
+name: Set up Rust
+description: Toolchain from rust-toolchain.toml, Swatinem/rust-cache, optional cargo-nextest, job timer.
+inputs:
+  cache-key:
+    description: >-
+      rust-cache shared-key. Jobs that build the same artifacts share one key; matrix entries
+      use one key per entry. Only runs on main save the cache, pull requests restore it.
+    required: true
+  nextest:
+    description: Install cargo-nextest when 'true'.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Start job timer
+      shell: bash
+      run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+    # rustup >= 1.28 no longer installs the toolchain from rust-toolchain.toml on first use.
+    - name: Install toolchain from rust-toolchain.toml
+      shell: bash
+      run: rustup show active-toolchain >/dev/null 2>&1 || rustup toolchain install
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+        cache-on-failure: true
+    - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+      if: inputs.nextest == 'true'
+      with:
+        tool: nextest@0.9.151
