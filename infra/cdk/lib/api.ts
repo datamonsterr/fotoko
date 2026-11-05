@@ -118,6 +118,7 @@ export class Api extends Construct {
       props.httpFunction,
     );
     const iamAuthorizer = new HttpIamAuthorizer();
+    const stageResource = this.stage;
     for (const spec of ROUTES) {
       const httpRoute = new HttpRoute(
         this,
@@ -129,6 +130,10 @@ export class Api extends Construct {
           ...(spec.iam ? { authorizer: iamAuthorizer } : {}),
         },
       );
+      // RouteSettings reference routes by key: the stage must deploy after the routes exist.
+      if (`${spec.method} ${spec.path}` in routeSettings) {
+        stageResource.node.addDependency(httpRoute);
+      }
       if (!spec.iam) {
         Validations.of(httpRoute).acknowledge({
           id: 'AwsSolutions-APIG4',

@@ -86,3 +86,24 @@ describe('HTTP API routes', () => {
     });
   });
 });
+
+describe('stage deployment order', () => {
+  it('makes the stage depend on every route that has route settings', () => {
+    const stage = Object.values(
+      template.findResources('AWS::ApiGatewayV2::Stage'),
+    )[0];
+    const deps = ((stage as { DependsOn?: string[] }).DependsOn ?? []).join(
+      ' ',
+    );
+    const throttled = Object.entries(
+      template.findResources('AWS::ApiGatewayV2::Route'),
+    ).filter(
+      ([, r]) =>
+        (r.Properties as { RouteKey: string }).RouteKey !== 'GET /healthz' &&
+        (r.Properties as { RouteKey: string }).RouteKey !==
+          'GET /v1/printers/{printerId}',
+    );
+    expect(throttled).toHaveLength(5);
+    for (const [id] of throttled) expect(deps).toContain(id);
+  });
+});

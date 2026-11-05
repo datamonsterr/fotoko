@@ -6,6 +6,7 @@ import {
   rm,
   stat,
   writeFile,
+  symlink,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -224,13 +225,16 @@ describe('provisionPrinter', () => {
         provisionPrinter(
           new IoTClient({}),
           options({
-            // The key path is a directory, so writing the key fails after both attachments.
+            // The key path is a dangling symlink, so writing the key fails after both attachments.
             outDir: await (async () => {
               const dir = join(outDir, 'blocked');
-              await mkdir(join(dir, 'private.pem.key'), { recursive: true });
+              await mkdir(dir, { recursive: true });
+              await symlink(
+                '/nonexistent/target',
+                join(dir, 'private.pem.key'),
+              );
               return dir;
             })(),
-            force: true,
           }),
         ),
       ).rejects.toThrow(/Rolled back/);
@@ -249,9 +253,10 @@ describe('provisionPrinter', () => {
 
     it('removes the key file it wrote when a later write fails', async () => {
       await mkdir(outDir, { recursive: true });
-      await mkdir(join(outDir, 'agent.toml')); // a directory: writing the toml fails
+      // A dangling symlink passes the existence pre-check but 'wx' refuses it: the toml write fails.
+      await symlink('/nonexistent/target', join(outDir, 'agent.toml'));
       await expect(
-        provisionPrinter(new IoTClient({}), options({ force: true })),
+        provisionPrinter(new IoTClient({}), options()),
       ).rejects.toThrow(/Rolled back/);
       expect(await fileExists(join(outDir, 'private.pem.key'))).toBe(false);
       expect(await fileExists(join(outDir, 'device.pem.crt'))).toBe(false);
@@ -383,6 +388,24 @@ describe('provisionPrinter', () => {
       for (const call of iot.commandCalls(DetachThingPrincipalCommand)) {
         expect(call.args[0].input.principal).not.toBe(OLD_ARN);
       }
+    });
+
+    it('retires old certificates across paginated principal lists', async () => {
+      iot
+        .on(ListThingPrincipalsCommand)
+        .resolvesOnce({ principals: [OLD_ARN], nextToken: 'page2' })
+        .resolvesOnce({
+          principals: ['arn:aws:iot:ap-southeast-1:123456789012:cert/older'],
+        });
+      await provisionPrinter(new IoTClient({}), options({ rotate: true }));
+      expect(
+        iot
+          .commandCalls(DeleteCertificateCommand)
+          .map((c) => c.args[0].input.certificateId),
+      ).toEqual(['old', 'older']);
+      expect(
+        iot.commandCalls(ListThingPrincipalsCommand)[1]?.args[0].input,
+      ).toEqual({ thingName: 'stand-001', nextToken: 'page2' });
     });
 
     it('warns, but succeeds, when the old certificate cannot be retired', async () => {

@@ -141,13 +141,14 @@ export class Functions extends Construct {
         resources: [photosBucket.arnForObjects(`${ORDERS_PREFIX}*`)],
       }),
     );
-    // Without s3:ListBucket, HeadObject on a missing key answers 403 instead of 404.
+    // HeadObject on a missing key answers 403 instead of 404 without s3:ListBucket. A s3:prefix
+    // condition would not help: it only applies to ListObjects, not HeadObject. The bucket holds
+    // nothing but orders/ keys, so the grant is on the bucket ARN without a condition.
     http.role.addToPolicy(
       new PolicyStatement({
         effect: Effect.ALLOW,
         actions: ['s3:ListBucket'],
         resources: [photosBucket.bucketArn],
-        conditions: { StringLike: { 's3:prefix': `${ORDERS_PREFIX}*` } },
       }),
     );
     Validations.of(http.role).acknowledge(
