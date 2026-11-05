@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "ba8110fe0b14d71a8c5f3a574201d25fa1805f4c76b9e7bc6fd592e896c6cbad",
+  "source": "https://github.com/awslabs/agent-plugins/tree/HEAD/plugins/aws-serverless/skills/aws-serverless-deployment",
+  "ref": "HEAD",
+  "revision": "fbefb3764e67558fe10ac834dd85db49734aa9b6",
+  "category": "devops",
+  "installedAt": "2026-11-05T09:19:25.132Z"
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "58df4c62b69a096a849e9ce0413b35bebdc748188bb0eae39f8bce268c0cdbe5",
+  "source": "https://github.com/getsentry/skills/tree/HEAD/skills/security-review",
+  "ref": "HEAD",
+  "revision": "0c464f411bdfb8d4c12314b36264d06cb2f60270",
+  "category": "security",
+  "installedAt": "2026-11-05T09:19:27.974Z"
+}

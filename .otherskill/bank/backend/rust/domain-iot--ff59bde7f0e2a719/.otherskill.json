@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "ff59bde7f0e2a7199284739989af9198c6720355b90f03551358376128ed0a73",
+  "source": "https://github.com/actionbook/rust-skills/tree/HEAD/skills/domain-iot",
+  "ref": "HEAD",
+  "revision": "5c40d3ad785193231b7d0dbfb8e1eb447e5edd94",
+  "category": "backend/rust",
+  "installedAt": "2026-11-05T09:19:21.646Z"
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "d8ae62ef18becb6e3593b1b2781842a85f0d6718d377fd74c2033e618abe9e10",
+  "source": "https://github.com/getsentry/skills/tree/HEAD/skills/gha-security-review",
+  "ref": "HEAD",
+  "revision": "0c464f411bdfb8d4c12314b36264d06cb2f60270",
+  "category": "security",
+  "installedAt": "2026-11-05T09:19:28.708Z"
+}

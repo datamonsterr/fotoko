@@ -1,0 +1,64 @@
+{
+  "bankPath": ".otherskill/bank",
+  "model": "inception/mercury-decide:free",
+  "scope": "project",
+  "agent": "claude",
+  "agents": ["claude"],
+  "portableHooks": true,
+  "enabledCategories": [
+    "frontend/react",
+    "frontend/ui-ux",
+    "backend/rust",
+    "devops",
+    "testing",
+    "security",
+    "management",
+    "docs"
+  ],
+  "categories": [
+    {
+      "id": "frontend/react",
+      "description": "Expo, React Native and React app patterns, components, navigation and state"
+    },
+    {
+      "id": "frontend/ui-ux",
+      "description": "Interface design, accessibility, mobile UX and visual usability"
+    },
+    {
+      "id": "backend/rust",
+      "description": "Rust backend: async, tokio, axum, error handling, AWS Lambda, DynamoDB, MQTT clients and Raspberry Pi agents"
+    },
+    {
+      "id": "devops",
+      "description": "AWS CDK, serverless infrastructure, IoT Core, CI, GitHub Actions, deployment and Raspberry Pi provisioning"
+    },
+    {
+      "id": "testing",
+      "description": "Testing, TDD, Playwright, Maestro, simulation and verification"
+    },
+    {
+      "id": "security",
+      "description": "Security policy, credential hygiene, webhooks signatures and payment safety"
+    },
+    {
+      "id": "management",
+      "description": "Find, create, install and maintain agent skills, plans and project workflows"
+    },
+    {
+      "id": "docs",
+      "description": "Technical writing, diagrams, specs and documentation maintenance"
+    }
+  ],
+  "limits": {
+    "concurrency": 4,
+    "retries": 1,
+    "retryDelayMs": 250,
+    "timeoutMs": 10000,
+    "maxRequestBytes": 60000,
+    "maxCandidates": 200,
+    "categoryThreshold": 0.05,
+    "skillThreshold": 0.05,
+    "maxCategories": 4,
+    "maxSkills": 6
+  }
+}

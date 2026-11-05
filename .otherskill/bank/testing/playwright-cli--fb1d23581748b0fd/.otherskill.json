@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "logicalId": "fb1d23581748b0fd1bf7f1945e529121ae4fd8f2ac401028f7c40fb491c34e79",
+  "source": "https://github.com/microsoft/playwright-cli/tree/HEAD/skills/playwright-cli",
+  "ref": "HEAD",
+  "revision": "f50f57905b9fd3dd355330719ddf0687000c9437",
+  "category": "testing",
+  "installedAt": "2026-11-05T09:19:26.384Z"
+}
