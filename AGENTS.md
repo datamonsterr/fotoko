@@ -12,7 +12,8 @@ On-site pay-to-print photo kiosk. Customers scan a QR code at a Stand, upload ph
 | `infra/cdk`                                            | AWS CDK app                                            |
 | `packages/e2e-web`                                     | Playwright web e2e                                     |
 | `deploy/pi`                                            | Pi provisioning and cross-build                        |
-| `scripts/ci`                                           | `fast.sh` and `all.sh`                                 |
+| `scripts/ci`                                           | `fast.sh`, `all.sh`, `repro.sh` (one CI job locally)   |
+| `.github`                                              | CI (`ci.yml`), deploy, Dependabot, PR template         |
 
 Cargo members are `crates/*`; pnpm packages are `apps/*`, `packages/*`, `infra/*`. A new crate or package is picked up by the globs with no root edit, except that a crate other crates depend on needs a `path` entry in the root `[workspace.dependencies]`.
 
@@ -39,6 +40,10 @@ Pre-commit checks formatting of staged files; commit-msg enforces Conventional C
 - Check current docs before coding against any library, framework, SDK or CLI (Context7 MCP, AWS documentation MCP, vendor docs). Never write an API from memory. Pin versions.
 - Change `docs/contracts.md` first when an interface changes.
 - Skills: see `docs/skills.md`. The OtherSkill hook routes bank skills per prompt when `OPENROUTER_API_KEY` is set. Suggested MCP servers are in `.mcp.json`.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every PR and push to `main`; the single required check is `ci-ok` (skipped jobs count as passed). Every job runs `bash scripts/ci/repro.sh <job>`, so the job id is also the local repro command. The fix loop: push, read the failed job's summary (it lists the failing tests and the exact command), run that command locally, fix, repeat. `bash scripts/ci/fast.sh` is the pre-push check and `bash scripts/ci/all.sh` mirrors the whole workflow. Job map, caching and how to add jobs: `docs/ci.md`.
 
 ## Test pyramid
 

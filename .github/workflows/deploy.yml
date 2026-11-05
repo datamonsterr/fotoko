@@ -1,0 +1,62 @@
+name: Deploy
+
+# Push to main deploys dev. Prod (and manual dev) deploys come from workflow_dispatch.
+# Approvals live in the GitHub environments `dev` and `prod` (add required reviewers to prod).
+# Repository or environment variables: AWS_DEPLOY_ROLE_ARN (OIDC role to assume, per environment).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Stage to deploy
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  contents: read
+
+# Deploys to one stage never overlap and are never cancelled half way.
+concurrency:
+  group: deploy-${{ inputs.stage || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+
+jobs:
+  deploy:
+    name: deploy (${{ inputs.stage || 'dev' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ${{ inputs.stage || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      STAGE: ${{ inputs.stage || 'dev' }}
+      AWS_REGION: ap-southeast-1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: lambda
+      - uses: ./.github/actions/setup-js
+      - name: Install cargo-lambda
+        run: pipx install cargo-lambda==1.9.2
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy
+        run: bash scripts/deploy/aws.sh "$STAGE"
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh "deploy ${STAGE}" "bash scripts/deploy/aws.sh --dry-run ${STAGE}" "stack Fotoko-${STAGE} in ${AWS_REGION}"
