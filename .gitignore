@@ -1,0 +1,37 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node
+node_modules/
+.pnpm-store/
+.turbo/
+*.tsbuildinfo
+dist/
+dist-*/
+coverage/
+
+# Expo / CDK / Playwright
+.expo/
+cdk.out/
+playwright-report/
+test-results/
+apps/mobile/expo-env.d.ts
+
+# Env and secrets (never commit)
+.env*
+!.env.example
+*.pem
+*.key
+*.crt
+!**/fixtures/**/*.pem
+
+# Local worktree cargo config (per-worktree target dir)
+/.cargo/config.toml
+
+# Local state
+.DS_Store
+__pycache__/
+.ci-cache/
+.claude/worktrees/
+.claude/settings.local.json

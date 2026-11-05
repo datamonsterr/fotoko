@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+.turbo/
+.expo/
+dist/
+dist-*/
+coverage/
+target/
+cdk.out/
+pnpm-lock.yaml
+.otherskill/
+.claude/skills/
+playwright-report/
+test-results/
