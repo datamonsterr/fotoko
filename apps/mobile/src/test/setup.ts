@@ -39,16 +39,21 @@ jest.mock('expo-camera', () => {
 
 jest.mock('expo-router', () => {
   const router = { push: jest.fn(), replace: jest.fn(), back: jest.fn() };
+  const stackScreen = jest.fn(() => null);
   const Stack = Object.assign(
     ({ children }: { children?: unknown }) => children ?? null,
-    {
-      Screen: () => null,
-    },
+    { Screen: stackScreen },
   );
   return {
     __router: router,
+    __stackScreen: stackScreen,
     useRouter: () => router,
     useLocalSearchParams: jest.fn(),
     Stack,
   };
 });
+
+// jest-expo's AppState mock returns no subscription; give it one.
+jest.requireActual('react-native').AppState.addEventListener = jest.fn(() => ({
+  remove: jest.fn(),
+}));

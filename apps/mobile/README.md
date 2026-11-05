@@ -48,7 +48,23 @@ payOS `returnUrl`/`cancelUrl` are `{PUBLIC_APP_URL}/orders/{orderId}`. On web th
 
 Why not the AWS SDK or Amplify: Hermes has no `crypto.subtle`, React Native's `URL` is only partly implemented (the signer parses URLs by hand), and `@aws-sdk/credential-providers` pulls in the full SDK client stack. The app instead calls the two Cognito Identity JSON endpoints (`GetId`, `GetCredentialsForIdentity`, no signing needed) with `fetch`, caches credentials until 5 minutes before expiry, and signs with `@smithy/signature-v4` plus the pure-JS `@aws-crypto/sha256-js`. This works unchanged on iOS, Android and web.
 
+Robustness: a gateway-level 401/403 (`{"message": ...}`, not the contract's `forbidden`) drops the cached credentials and retries once; a second one surfaces as `ApiError('auth')`. Every response's `Date` header updates a server-clock offset that is used for the signing time and for judging whether a presigned URL or the order has expired, so a phone with a wrong clock still works. If Cognito says the stored identity no longer exists (`ResourceNotFoundException`, `NotAuthorizedException`), the app forgets it, calls `GetId` again and retries once.
+
 Presigned S3 PUTs carry no auth headers; the headers from `uploads[].headers` are sent as given.
+
+## Web and CORS
+
+The web build calls the API and S3 from the browser, so both need CORS:
+
+- API Gateway: allow origin = the web app's origin; allow headers `content-type`, `accept`, `authorization`, `x-amz-date`, `x-amz-security-token`, `x-fotoko-identity` (local mode); allow methods `GET, POST, OPTIONS`; **expose header `Date`** (`Access-Control-Expose-Headers: Date`), otherwise browsers hide it and the clock-skew correction silently stays at 0.
+- S3 bucket: allow `PUT` from the web origin with the headers the presigned URL signs (at least `content-type`).
+- Cognito Identity (`cognito-identity.<region>.amazonaws.com`) already answers browser CORS.
+
+On web the local-mode identity lives in `localStorage`: readable by any script on the origin. That is acceptable for a test identity; production uses aws mode.
+
+## Leaving the upload screen
+
+While the order is created, photos upload or checkout opens, the back gesture, header back button and Android hardware back are blocked, and unmounting aborts in-flight uploads without checking out. After a failure they work again. If the order or an upload URL expires, the screen offers "Start over": it cancels the old order (best effort) and creates a new one from the same photos.
 
 ## i18n
 

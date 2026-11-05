@@ -18,52 +18,61 @@ describe('detectContentType', () => {
 
 describe('toDraftPhotos', () => {
   let n = 0;
+  const sizes: Record<string, number> = {};
   const base = {
     existingCount: 0,
     newId: () => `id-${++n}`,
-    readSize: jest.fn().mockResolvedValue(4096),
+    readSize: jest.fn(async (uri: string) => sizes[uri] ?? 4096),
   };
 
-  it('converts supported assets with 1 copy', async () => {
+  it('converts supported assets with 1 copy, sized from the real bytes', async () => {
+    sizes['a.jpg'] = 1234;
     const r = await toDraftPhotos(
-      [{ uri: 'a.jpg', mimeType: 'image/jpeg', fileSize: 1000 }],
+      // the picker's fileSize is ignored: it can differ from what is uploaded
+      [{ uri: 'a.jpg', mimeType: 'image/jpeg', fileSize: 999_999 }],
       base,
     );
+    expect(base.readSize).toHaveBeenCalledWith('a.jpg');
     expect(r.photos).toEqual([
       {
         id: expect.any(String),
         uri: 'a.jpg',
         contentType: 'image/jpeg',
-        sizeBytes: 1000,
+        sizeBytes: 1234,
         copies: 1,
       },
     ]);
   });
 
-  it('reads the size when the picker gives none', async () => {
-    const r = await toDraftPhotos(
-      [{ uri: 'a.png', mimeType: 'image/png' }],
-      base,
-    );
-    expect(base.readSize).toHaveBeenCalledWith('a.png');
-    expect(r.photos[0]?.sizeBytes).toBe(4096);
-  });
-
   it('counts unsupported, too big, empty and over-limit assets', async () => {
+    Object.assign(sizes, {
+      'a.heic': 10,
+      'big.jpg': 15 * 1024 * 1024 + 1,
+      'empty.jpg': 0,
+      'ok.jpg': 15 * 1024 * 1024,
+      'late.jpg': 1,
+    });
     const assets = [
-      { uri: 'a.heic', mimeType: 'image/heic', fileSize: 10 },
-      {
-        uri: 'big.jpg',
-        mimeType: 'image/jpeg',
-        fileSize: 15 * 1024 * 1024 + 1,
-      },
-      { uri: 'empty.jpg', mimeType: 'image/jpeg', fileSize: 0 },
-      { uri: 'ok.jpg', mimeType: 'image/jpeg', fileSize: 15 * 1024 * 1024 },
-      { uri: 'late.jpg', mimeType: 'image/jpeg', fileSize: 1 },
+      { uri: 'a.heic', mimeType: 'image/heic' },
+      { uri: 'big.jpg', mimeType: 'image/jpeg' },
+      { uri: 'empty.jpg', mimeType: 'image/jpeg' },
+      { uri: 'ok.jpg', mimeType: 'image/jpeg' },
+      { uri: 'late.jpg', mimeType: 'image/jpeg' },
     ];
     const r = await toDraftPhotos(assets, { ...base, existingCount: 9 });
     expect(r).toMatchObject({ tooBig: 1, unsupported: 2, overLimit: 1 });
     expect(r.photos.map((p) => p.uri)).toEqual(['ok.jpg']);
+  });
+
+  it('a read failure rejects (the picker hook turns it into a notice)', async () => {
+    await expect(
+      toDraftPhotos([{ uri: 'x.jpg', mimeType: 'image/jpeg' }], {
+        ...base,
+        readSize: async () => {
+          throw new Error('unreadable');
+        },
+      }),
+    ).rejects.toThrow('unreadable');
   });
 });
 

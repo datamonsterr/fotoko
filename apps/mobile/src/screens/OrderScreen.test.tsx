@@ -4,9 +4,11 @@ import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 import { ApiError, type ApiClient, type Order, type OrderStatus } from '@/api';
 import { order } from '@/test/fixtures';
 import { usePhotoDraft } from '@/state/draft';
-import { draftPhoto, renderApp, router } from '@/test/render';
+import { draftPhoto, renderApp, router, withApi } from '@/test/render';
 
-import { OrderScreen } from './OrderScreen';
+import { OrderScreen as RealOrderScreen } from './OrderScreen';
+
+const OrderScreen = withApi(RealOrderScreen);
 
 beforeEach(() => jest.clearAllMocks());
 
@@ -49,11 +51,7 @@ describe('OrderScreen', () => {
   it('transient failure before the first response keeps the spinner path out of the way', async () => {
     const getOrder = jest.fn().mockRejectedValue(new ApiError('network', 'x'));
     await renderApp(
-      <OrderScreen
-        orderId="o"
-        client={clientWith({ getOrder })}
-        intervalMs={5}
-      />,
+      <OrderScreen orderId="o" client={clientWith({ getOrder })} />,
     );
     await waitFor(() =>
       expect(screen.getByTestId('order-error')).toHaveTextContent(
@@ -214,14 +212,12 @@ describe('OrderScreen', () => {
       .mockResolvedValueOnce(at('paid'))
       .mockResolvedValue(at('completed'));
     await renderApp(
-      <OrderScreen
-        orderId="ord-1"
-        client={clientWith({ getOrder })}
-        intervalMs={5}
-      />,
+      <OrderScreen orderId="ord-1" client={clientWith({ getOrder })} />,
     );
-    await waitFor(() =>
-      expect(screen.getByTestId('order-done')).toBeOnTheScreen(),
+    // second poll comes after the real 2 s interval
+    await waitFor(
+      () => expect(screen.getByTestId('order-done')).toBeOnTheScreen(),
+      { timeout: 4000 },
     );
     expect(getOrder).toHaveBeenCalledTimes(2);
   });
@@ -232,14 +228,11 @@ describe('OrderScreen', () => {
       .mockResolvedValueOnce(at('paid'))
       .mockRejectedValue(new ApiError('network', 'x'));
     await renderApp(
-      <OrderScreen
-        orderId="ord-1"
-        client={clientWith({ getOrder })}
-        intervalMs={5}
-      />,
+      <OrderScreen orderId="ord-1" client={clientWith({ getOrder })} />,
     );
-    await waitFor(() =>
-      expect(screen.getByTestId('order-error')).toBeOnTheScreen(),
+    await waitFor(
+      () => expect(screen.getByTestId('order-error')).toBeOnTheScreen(),
+      { timeout: 4000 },
     );
     expect(screen.getByTestId('order-status')).toHaveTextContent(
       'Đã thanh toán',
@@ -295,6 +288,50 @@ describe('OrderScreen', () => {
         expect(screen.getByTestId('order-error')).toBeOnTheScreen(),
       );
       expect(screen.getByTestId('draft-count')).toHaveTextContent('1');
+    });
+  });
+
+  describe('session problems', () => {
+    it('two auth failures in a row stop polling and offer a retry that resumes', async () => {
+      jest.useFakeTimers();
+      const getOrder = jest
+        .fn()
+        .mockRejectedValueOnce(new ApiError('auth', 'Forbidden', 403))
+        .mockRejectedValueOnce(new ApiError('auth', 'Forbidden', 403))
+        .mockResolvedValue(at('paid'));
+      await renderApp(
+        <OrderScreen orderId="ord-1" client={clientWith({ getOrder })} />,
+      );
+      const { act } = jest.requireActual(
+        '@testing-library/react-native',
+      ) as typeof import('@testing-library/react-native');
+      for (let i = 0; i < 100; i++) {
+        await act(async () => {
+          await jest.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(screen.getByTestId('order-error')).toHaveTextContent(
+        /Không xác thực được phiên/,
+      );
+      expect(getOrder).toHaveBeenCalledTimes(2);
+      await fireEvent.press(screen.getByTestId('order-retry'));
+      await act(async () => {});
+      expect(screen.getByTestId('order-status')).toHaveTextContent(
+        'Đã thanh toán',
+      );
+    });
+
+    it('other stopped errors have no retry button', async () => {
+      const getOrder = jest
+        .fn()
+        .mockRejectedValue(new ApiError('forbidden', 'x', 403));
+      await renderApp(
+        <OrderScreen orderId="ord-1" client={clientWith({ getOrder })} />,
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId('order-error')).toBeOnTheScreen(),
+      );
+      expect(screen.queryByTestId('order-retry')).toBeNull();
     });
   });
 });

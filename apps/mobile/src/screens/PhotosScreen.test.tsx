@@ -1,13 +1,23 @@
-import { fireEvent, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react-native';
 import * as ImagePicker from 'expo-image-picker';
 
 import { ApiError, type ApiClient } from '@/api';
 import { printer } from '@/test/fixtures';
-import { draftPhoto, renderApp, router } from '@/test/render';
+import { draftPhoto, renderApp, router, withApi } from '@/test/render';
 
-import { PhotosScreen } from './PhotosScreen';
+import { PhotosScreen as RealPhotosScreen } from './PhotosScreen';
 
 const launch = ImagePicker.launchImageLibraryAsync as jest.Mock;
+
+jest.mock('@/lib/photos', () => ({
+  ...jest.requireActual('@/lib/photos'),
+  // sizes come from the real bytes; the test names say how big
+  readBlobSize: jest.fn(async (uri: string) =>
+    uri.includes('big') ? 16 * 1024 * 1024 : 1000,
+  ),
+}));
+
+const PhotosScreen = withApi(RealPhotosScreen);
 
 beforeEach(() => jest.clearAllMocks());
 
@@ -139,7 +149,7 @@ describe('PhotosScreen', () => {
     launch.mockResolvedValue({
       canceled: false,
       assets: [
-        asset('big.jpg', { fileSize: 16 * 1024 * 1024 }),
+        asset('big.jpg'),
         asset('x.heic', { mimeType: 'image/heic' }),
         asset('ok.jpg'),
         asset('late.jpg'),
@@ -172,5 +182,32 @@ describe('PhotosScreen', () => {
       pathname: '/p/[printerId]/upload',
       params: { printerId: 'stand-001' },
     });
+  });
+
+  it('disables the add button while the picker is open, then re-enables it', async () => {
+    let finish: (v: unknown) => void = () => {};
+    launch.mockReturnValue(new Promise((r) => (finish = r)));
+    await renderReady();
+    await fireEvent.press(screen.getByTestId('picker-add'));
+    await waitFor(() =>
+      expect(screen.getByTestId('picker-add')).toBeDisabled(),
+    );
+    expect(launch).toHaveBeenCalledTimes(1);
+    await fireEvent.press(screen.getByTestId('picker-add'));
+    expect(launch).toHaveBeenCalledTimes(1);
+    await act(async () => finish({ canceled: true, assets: null }));
+    await waitFor(() => expect(screen.getByTestId('picker-add')).toBeEnabled());
+  });
+
+  it('a picker failure becomes a notice instead of an unhandled rejection', async () => {
+    launch.mockRejectedValue(new Error('permission denied'));
+    await renderReady();
+    await fireEvent.press(screen.getByTestId('picker-add'));
+    await waitFor(() =>
+      expect(screen.getByTestId('picker-notice-0')).toHaveTextContent(
+        /Không mở được thư viện ảnh/,
+      ),
+    );
+    expect(screen.getByTestId('picker-add')).toBeEnabled();
   });
 });

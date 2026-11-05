@@ -140,4 +140,78 @@ describe('getGuestCredentials', () => {
     expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
   });
+
+  it.each([
+    'ResourceNotFoundException',
+    'NotAuthorizedException',
+    'com.amazonaws#ResourceNotFoundException',
+  ])(
+    'a stored identity rejected with %s is replaced: new GetId, then one retry',
+    async (type) => {
+      const f = jest
+        .fn()
+        .mockResolvedValueOnce(json(400, { __type: type, message: 'gone' }))
+        .mockResolvedValueOnce(json(200, { IdentityId: 'r:new' }))
+        .mockResolvedValueOnce(json(200, credsBody));
+      const store = memStore({ [COGNITO_IDENTITY_KEY]: 'r:stale' });
+      const c = await getGuestCredentials(opts(f, store));
+      expect(c.accessKeyId).toBe('AK');
+      expect(store.m.get(COGNITO_IDENTITY_KEY)).toBe('r:new');
+      const targets = f.mock.calls.map(
+        (c) => (c[1] as RequestInit).headers as Record<string, string>,
+      );
+      expect(targets.map((h) => h['x-amz-target']?.split('.')[1])).toEqual([
+        'GetCredentialsForIdentity',
+        'GetId',
+        'GetCredentialsForIdentity',
+      ]);
+    },
+  );
+
+  it('retries only once: a second failure surfaces', async () => {
+    const f = jest
+      .fn()
+      .mockResolvedValueOnce(json(400, { __type: 'ResourceNotFoundException' }))
+      .mockResolvedValueOnce(json(200, { IdentityId: 'r:new' }))
+      .mockResolvedValueOnce(
+        json(400, { __type: 'ResourceNotFoundException' }),
+      );
+    await expect(
+      getGuestCredentials(
+        opts(f, memStore({ [COGNITO_IDENTITY_KEY]: 'r:stale' })),
+      ),
+    ).rejects.toMatchObject({ type: 'ResourceNotFoundException' });
+    expect(f).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not clear the identity for other errors, nor for a fresh identity', async () => {
+    const store = memStore({ [COGNITO_IDENTITY_KEY]: 'r:keep' });
+    const f1 = jest
+      .fn()
+      .mockResolvedValue(json(500, { __type: 'InternalErrorException' }));
+    await expect(getGuestCredentials(opts(f1, store))).rejects.toThrow(
+      /InternalError|failed/,
+    );
+    expect(store.m.get(COGNITO_IDENTITY_KEY)).toBe('r:keep');
+
+    const f2 = jest
+      .fn()
+      .mockResolvedValueOnce(json(200, { IdentityId: 'r:fresh' }))
+      .mockResolvedValueOnce(json(400, { __type: 'NotAuthorizedException' }));
+    await expect(getGuestCredentials(opts(f2))).rejects.toThrow(
+      /NotAuthorized/,
+    );
+    expect(f2).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats an emptied stored identity as missing', async () => {
+    const f = jest
+      .fn()
+      .mockResolvedValueOnce(json(200, { IdentityId: 'r:1' }))
+      .mockResolvedValueOnce(json(200, credsBody));
+    await getGuestCredentials(
+      opts(f, memStore({ [COGNITO_IDENTITY_KEY]: '' })),
+    );
+    expect(f).toHaveBeenCalledTimes(2);
+  });
 });

@@ -1,6 +1,7 @@
-import type { ReactElement } from 'react';
+import type { ComponentType, ReactElement } from 'react';
 import { render } from '@testing-library/react-native';
 
+import { setApiClient, type ApiClient } from '@/api';
 import { I18nProvider, type Locale } from '@/i18n';
 import type { DraftPhoto } from '@/lib/photos';
 import { PhotoDraftProvider } from '@/state/draft';
@@ -30,3 +31,16 @@ export const draftPhoto = (i: number, copies = 1): DraftPhoto => ({
   sizeBytes: 1000,
   copies,
 });
+
+/**
+ * Screens read the app-wide API client (`getApiClient`). This wrapper lets a test pass
+ * `client={() => fake}` and installs it before the screen renders, so the screens themselves
+ * carry no test-only props.
+ */
+export function withApi<P extends object>(Screen: ComponentType<P>) {
+  return function WithApi(props: P & { client?: () => ApiClient }) {
+    const { client, ...rest } = props;
+    if (client) setApiClient(client());
+    return <Screen {...(rest as unknown as P)} />;
+  };
+}

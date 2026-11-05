@@ -2,6 +2,8 @@ import { Sha256 } from '@aws-crypto/sha256-js';
 import { HttpRequest } from '@smithy/protocol-http';
 import { SignatureV4 } from '@smithy/signature-v4';
 
+import { serverClock } from '@/api/clock';
+
 import type { AwsCredentials } from './cognito';
 import type { Authenticator, SignableRequest } from './types';
 
@@ -11,6 +13,7 @@ export const REFRESH_SKEW_MS = 5 * 60 * 1000;
 export interface AwsAuthOptions {
   region: string;
   getCredentials: () => Promise<AwsCredentials>;
+  /** Defaults to the server-corrected clock (`serverClock`). */
   now?: () => number;
   /** API Gateway execute-api by default. */
   service?: string;
@@ -26,21 +29,24 @@ export function parseUrl(raw: string): {
   hostname: string;
   port: number | undefined;
   path: string;
-  query: Record<string, string>;
+  query: Record<string, string | string[]>;
 } {
   const m = /^(https?:)\/\/([^/?#]+)([^?#]*)(?:\?([^#]*))?/i.exec(raw);
   if (!m) throw new Error(`not an absolute http(s) URL: ${raw}`);
   const host = m[2] as string;
   const portMatch = /:(\d+)$/.exec(host);
-  const query: Record<string, string> = {};
+  const query: Record<string, string | string[]> = {};
   for (const pair of (m[4] ?? '').split('&')) {
     if (!pair) continue;
     const eq = pair.indexOf('=');
     const key = eq < 0 ? pair : pair.slice(0, eq);
     const value = eq < 0 ? '' : pair.slice(eq + 1);
-    query[decodeURIComponent(key.replace(/\+/g, ' '))] = decodeURIComponent(
-      value.replace(/\+/g, ' '),
-    );
+    const k = decodeURIComponent(key.replace(/\+/g, ' '));
+    const v = decodeURIComponent(value.replace(/\+/g, ' '));
+    const prev = query[k];
+    // Repeated keys are signed as separate pairs.
+    query[k] =
+      prev === undefined ? v : [...(Array.isArray(prev) ? prev : [prev]), v];
   }
   return {
     protocol: (m[1] as string).toLowerCase(),
@@ -54,7 +60,7 @@ export function parseUrl(raw: string): {
 
 /** Cognito guest credentials, cached until near expiry, used to SigV4-sign API calls. */
 export function createAwsAuth(options: AwsAuthOptions): Authenticator {
-  const now = options.now ?? Date.now;
+  const now = options.now ?? serverClock.now;
   let cached: AwsCredentials | undefined;
   let inflight: Promise<AwsCredentials> | undefined;
 
@@ -70,17 +76,23 @@ export function createAwsAuth(options: AwsAuthOptions): Authenticator {
   }
 
   return {
+    invalidate() {
+      cached = undefined;
+      inflight = undefined;
+    },
     async headers(req: SignableRequest) {
       const creds = await credentials();
       const signer = new SignatureV4({
         credentials: {
           accessKeyId: creds.accessKeyId,
           secretAccessKey: creds.secretAccessKey,
-          sessionToken: creds.sessionToken,
+          ...(creds.sessionToken ? { sessionToken: creds.sessionToken } : {}),
         },
         region: options.region,
         service: options.service ?? 'execute-api',
         sha256: Sha256,
+        // execute-api does not need x-amz-content-sha256; one less signed header.
+        applyChecksum: false,
       });
       const url = parseUrl(req.url);
       const signed = await signer.sign(

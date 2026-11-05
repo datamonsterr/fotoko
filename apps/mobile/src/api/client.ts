@@ -1,5 +1,6 @@
 import type { Authenticator } from '@/auth/types';
 
+import { serverClock } from './clock';
 import { ApiError, parseErrorBody } from './errors';
 import type {
   CheckoutResponse,
@@ -38,7 +39,7 @@ interface RequestOptions {
 export function createApiClient(options: ApiClientOptions): ApiClient {
   const base = options.baseUrl.replace(/\/+$/, '');
 
-  async function request<T>(opts: RequestOptions): Promise<T> {
+  async function attempt(opts: RequestOptions): Promise<Response> {
     const url = `${base}${opts.path}`;
     const body =
       opts.body === undefined ? undefined : JSON.stringify(opts.body);
@@ -55,12 +56,10 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
         }),
       );
     }
-
     const doFetch =
       options.fetchImpl ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
-    let res: Response;
     try {
-      res = await doFetch(url, {
+      return await doFetch(url, {
         method: opts.method,
         headers,
         body,
@@ -73,8 +72,25 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
         e instanceof Error ? e.message : 'network error',
       );
     }
+  }
 
-    const text = await res.text();
+  async function request<T>(opts: RequestOptions): Promise<T> {
+    let res = await attempt(opts);
+    serverClock.observe(res.headers?.get('date'));
+    let text = await res.text();
+    // A gateway-level 401/403 (expired or skewed credentials) gets one retry with fresh
+    // credentials and a corrected clock. A contract `forbidden` is an app answer: no retry.
+    if (
+      !res.ok &&
+      opts.authenticated &&
+      options.auth?.invalidate &&
+      parseErrorBody(res.status, text).code === 'auth'
+    ) {
+      options.auth.invalidate();
+      res = await attempt(opts);
+      serverClock.observe(res.headers?.get('date'));
+      text = await res.text();
+    }
     if (!res.ok) throw parseErrorBody(res.status, text);
     try {
       return JSON.parse(text) as T;

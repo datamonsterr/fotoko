@@ -1,14 +1,32 @@
-import { Platform } from 'react-native';
-import { fireEvent, screen, waitFor } from '@testing-library/react-native';
+import { BackHandler, Platform } from 'react-native';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react-native';
 
-import { ApiError, type ApiClient } from '@/api';
+import { ApiError, putPhoto, setApiClient, type ApiClient } from '@/api';
 import type { UploadArgs } from '@/api/upload';
+import { openCheckoutUrl } from '@/lib/checkout';
 import { createdOrder } from '@/test/fixtures';
 import { draftPhoto, renderApp, router } from '@/test/render';
 
 import { UploadScreen } from './UploadScreen';
 
-beforeEach(() => jest.clearAllMocks());
+jest.mock('@/lib/checkout', () => ({ openCheckoutUrl: jest.fn() }));
+jest.mock('@/api/upload', () => ({
+  ...jest.requireActual('@/api/upload'),
+  putPhoto: jest.fn(),
+}));
+
+const stackScreen = (
+  jest.requireMock('expo-router') as { __stackScreen: jest.Mock }
+).__stackScreen;
+
+const put = putPhoto as jest.Mock;
+const openCheckout = openCheckoutUrl as jest.Mock;
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  put.mockResolvedValue(undefined);
+  openCheckout.mockResolvedValue(undefined);
+});
 
 const checkoutRes = {
   orderId: 'ord-1',
@@ -24,26 +42,28 @@ function setup(
     upload?: (a: UploadArgs) => Promise<void>;
     checkout?: jest.Mock;
     createOrder?: jest.Mock;
-    openCheckout?: jest.Mock;
+    cancelOrder?: jest.Mock;
   } = {},
 ) {
   const createOrder =
     opts.createOrder ?? jest.fn().mockResolvedValue(createdOrder(n));
   const checkout = opts.checkout ?? jest.fn().mockResolvedValue(checkoutRes);
-  const openCheckout =
-    opts.openCheckout ?? jest.fn().mockResolvedValue(undefined);
-  const upload = jest.fn(opts.upload ?? (async () => {}));
+  const cancelOrder = opts.cancelOrder ?? jest.fn().mockResolvedValue({});
+  setApiClient({ createOrder, checkout, cancelOrder } as unknown as ApiClient);
+  if (opts.upload) put.mockImplementation(opts.upload);
   const photos = Array.from({ length: n }, (_, i) => draftPhoto(i));
-  const ui = (
-    <UploadScreen
-      printerId="stand-001"
-      client={() => ({ createOrder, checkout }) as unknown as ApiClient}
-      upload={upload}
-      openCheckout={openCheckout}
-    />
-  );
-  return { ui, photos, createOrder, checkout, openCheckout, upload };
+  return {
+    ui: <UploadScreen printerId="stand-001" />,
+    photos,
+    createOrder,
+    checkout,
+    cancelOrder,
+  };
 }
+
+const lastOptions = () =>
+  (stackScreen.mock.calls.at(-1) as unknown as [{ options: object }])[0]
+    .options;
 
 describe('UploadScreen', () => {
   it('happy path: creates, uploads, checks out, opens payOS, then shows the order', async () => {
@@ -56,8 +76,8 @@ describe('UploadScreen', () => {
       }),
     );
     expect(s.createOrder).toHaveBeenCalledTimes(1);
-    expect(s.upload).toHaveBeenCalledTimes(2);
-    expect(s.openCheckout).toHaveBeenCalledWith('https://pay.example/c');
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(openCheckout).toHaveBeenCalledWith('https://pay.example/c');
     expect(screen.getByTestId('upload-photo-status-1')).toHaveTextContent(
       'Đã tải lên',
     );
@@ -77,9 +97,6 @@ describe('UploadScreen', () => {
         'Đang tải lên 0%',
       ),
     );
-    const { act } = jest.requireActual(
-      '@testing-library/react-native',
-    ) as typeof import('@testing-library/react-native');
     await act(async () => report(0.5));
     expect(screen.getByTestId('upload-photo-status-0')).toHaveTextContent(
       'Đang tải lên 50%',
@@ -118,11 +135,31 @@ describe('UploadScreen', () => {
       'Tải lên thất bại',
     );
     expect(screen.queryByTestId('upload-photo-retry-1')).toBeNull();
+    expect(screen.getByTestId('upload-photo-retry-0')).toBeEnabled();
     expect(s.checkout).not.toHaveBeenCalled();
     fail = false;
     await fireEvent.press(screen.getByTestId('upload-photo-retry-0'));
     await waitFor(() => expect(router.replace).toHaveBeenCalled());
     expect(s.checkout).toHaveBeenCalledTimes(1);
+  });
+
+  it('retry is disabled while another photo is still uploading', async () => {
+    let release: () => void = () => {};
+    const s = setup(2, {
+      upload: (a) =>
+        a.url.endsWith('/0')
+          ? Promise.reject(new ApiError('network', 'x'))
+          : new Promise<void>((r) => (release = r)),
+    });
+    await renderApp(s.ui, { photos: s.photos });
+    await waitFor(() =>
+      expect(screen.getByTestId('upload-photo-retry-0')).toBeOnTheScreen(),
+    );
+    expect(screen.getByTestId('upload-photo-retry-0')).toBeDisabled();
+    await act(async () => release());
+    await waitFor(() =>
+      expect(screen.getByTestId('upload-photo-retry-0')).toBeEnabled(),
+    );
   });
 
   it('a failed order creation shows the mapped error; retry resumes', async () => {
@@ -156,11 +193,12 @@ describe('UploadScreen', () => {
     );
     await fireEvent.press(screen.getByTestId('upload-retry'));
     await waitFor(() => expect(router.replace).toHaveBeenCalled());
-    expect(s.upload).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledTimes(1);
   });
 
   it('shows the checkout phase while the payment page opens', async () => {
-    const s = setup(1, { openCheckout: jest.fn(() => new Promise(() => {})) });
+    openCheckout.mockReturnValue(new Promise(() => {}));
+    const s = setup(1);
     await renderApp(s.ui, { photos: s.photos });
     await waitFor(() =>
       expect(screen.getByTestId('upload-phase')).toHaveTextContent(
@@ -178,25 +216,111 @@ describe('UploadScreen', () => {
     expect(router.back).toHaveBeenCalled();
   });
 
-  it('uses the default checkout opener (web/native module) without crashing', async () => {
-    const WebBrowser = jest.requireMock('expo-web-browser') as {
-      openBrowserAsync: jest.Mock;
-    };
-    const createOrder = jest.fn().mockResolvedValue(createdOrder(1));
-    const checkout = jest.fn().mockResolvedValue(checkoutRes);
-    await renderApp(
-      <UploadScreen
-        printerId="p"
-        client={() => ({ createOrder, checkout }) as unknown as ApiClient}
-        upload={async () => {}}
-      />,
-      { photos: [draftPhoto(0)] },
-    );
-    await waitFor(() =>
-      expect(WebBrowser.openBrowserAsync).toHaveBeenCalledWith(
-        'https://pay.example/c',
-      ),
-    );
+  describe('expired order', () => {
+    const expiredOrder = () => ({
+      ...createdOrder(1),
+      uploads: [
+        { ...createdOrder(1).uploads[0], expiresAt: '2000-01-01T00:00:00Z' },
+      ],
+    });
+
+    it('shows a distinct message and Start over, which cancels the old order and re-creates', async () => {
+      const createOrder = jest
+        .fn()
+        .mockResolvedValueOnce(expiredOrder())
+        .mockResolvedValueOnce({ ...createdOrder(1), orderId: 'ord-2' });
+      const checkout = jest
+        .fn()
+        .mockResolvedValue({ ...checkoutRes, orderId: 'ord-2' });
+      const s = setup(1, { createOrder, checkout });
+      await renderApp(s.ui, { photos: s.photos });
+      await waitFor(() =>
+        expect(screen.getByTestId('upload-expired')).toHaveTextContent(
+          /hết hạn/,
+        ),
+      );
+      expect(put).not.toHaveBeenCalled();
+      expect(screen.queryByTestId('upload-error')).toBeNull();
+      await fireEvent.press(screen.getByTestId('upload-restart'));
+      await waitFor(() =>
+        expect(router.replace).toHaveBeenCalledWith({
+          pathname: '/orders/[orderId]',
+          params: { orderId: 'ord-2' },
+        }),
+      );
+      expect(s.cancelOrder).toHaveBeenCalledWith('ord-1');
+      expect(createOrder).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('leaving mid-flight', () => {
+    it('blocks the back gesture, header back and hardware back while working', async () => {
+      let handler: () => boolean = () => false;
+      const remove = jest.fn();
+      const spy = jest
+        .spyOn(BackHandler, 'addEventListener')
+        .mockImplementation(((_: string, h: () => boolean) => {
+          handler = h;
+          return { remove };
+        }) as never);
+      const s = setup(1, { upload: () => new Promise(() => {}) });
+      await renderApp(s.ui, { photos: s.photos });
+      await waitFor(() =>
+        expect(screen.getByTestId('upload-photo-status-0')).toHaveTextContent(
+          /Đang tải lên/,
+        ),
+      );
+      expect(lastOptions()).toEqual({
+        gestureEnabled: false,
+        headerBackVisible: false,
+      });
+      expect(handler()).toBe(true);
+      spy.mockRestore();
+    });
+
+    it('allows leaving again after a failure, and releases the hardware back', async () => {
+      const remove = jest.fn();
+      const spy = jest
+        .spyOn(BackHandler, 'addEventListener')
+        .mockImplementation((() => ({ remove })) as never);
+      const s = setup(1, {
+        upload: async () => {
+          throw new ApiError('network', 'x');
+        },
+      });
+      await renderApp(s.ui, { photos: s.photos });
+      await waitFor(() =>
+        expect(screen.getByTestId('upload-photo-retry-0')).toBeOnTheScreen(),
+      );
+      expect(lastOptions()).toEqual({
+        gestureEnabled: true,
+        headerBackVisible: true,
+      });
+      expect(remove).toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('unmounting mid-upload aborts it and never checks out or opens payOS', async () => {
+      let signal: AbortSignal | undefined;
+      let finish: () => void = () => {};
+      const s = setup(1, {
+        upload: (a) => {
+          signal = a.signal;
+          return new Promise<void>((r) => (finish = r));
+        },
+      });
+      const { unmount } = await renderApp(s.ui, { photos: s.photos });
+      await waitFor(() => expect(put).toHaveBeenCalled());
+      await unmount();
+      expect(signal?.aborted).toBe(true);
+      finish();
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 10));
+      });
+      expect(s.checkout).not.toHaveBeenCalled();
+      expect(openCheckout).not.toHaveBeenCalled();
+      expect(router.replace).not.toHaveBeenCalled();
+    });
   });
 
   describe('web', () => {
@@ -212,7 +336,7 @@ describe('UploadScreen', () => {
       const s = setup(1);
       await renderApp(s.ui, { photos: s.photos });
       await waitFor(() =>
-        expect(s.openCheckout).toHaveBeenCalledWith('https://pay.example/c'),
+        expect(openCheckout).toHaveBeenCalledWith('https://pay.example/c'),
       );
       await waitFor(() =>
         expect(screen.getByTestId('upload-phase')).toHaveTextContent(
@@ -221,12 +345,5 @@ describe('UploadScreen', () => {
       );
       expect(router.replace).not.toHaveBeenCalled();
     });
-  });
-
-  it('native: the draft is not cleared by the upload screen itself', async () => {
-    const s = setup(1);
-    await renderApp(s.ui, { photos: s.photos });
-    await waitFor(() => expect(router.replace).toHaveBeenCalled());
-    expect(screen.getByTestId('upload-photo-0')).toBeOnTheScreen();
   });
 });

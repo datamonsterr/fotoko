@@ -13,6 +13,8 @@ describe('errorMessageKey', () => {
     'network',
     'invalid_response',
     'upload_failed',
+    'auth',
+    'expired',
   ])('maps %s', (code) => {
     expect(errorMessageKey(new ApiError(code, 'm'))).toBe(`error.${code}`);
   });

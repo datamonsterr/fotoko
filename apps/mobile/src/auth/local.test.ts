@@ -39,4 +39,16 @@ describe('local auth', () => {
     });
     expect(newId).not.toHaveBeenCalled();
   });
+
+  it('does not cache a failed lookup: the next request tries again', async () => {
+    const store = memStore();
+    (store.get as jest.Mock).mockRejectedValueOnce(
+      new Error('keychain locked'),
+    );
+    const auth = createLocalAuth({ store, newId: () => 'local-1' });
+    await expect(auth.headers(req)).rejects.toThrow('keychain locked');
+    await expect(auth.headers(req)).resolves.toEqual({
+      [IDENTITY_HEADER]: 'local-1',
+    });
+  });
 });

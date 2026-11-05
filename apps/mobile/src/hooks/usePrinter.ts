@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import { getApiClient, type ApiClient, type Printer } from '@/api';
+import { getApiClient, type Printer } from '@/api';
 
 export type PrinterState =
   | { phase: 'loading' }
@@ -12,17 +12,17 @@ type Settled = {
   result: Exclude<PrinterState, { phase: 'loading' }>;
 };
 
-export function usePrinter(
-  printerId: string,
-  client: () => ApiClient = getApiClient,
-): { state: PrinterState; reload: () => void } {
+export function usePrinter(printerId: string): {
+  state: PrinterState;
+  reload: () => void;
+} {
   const [settled, setSettled] = useState<Settled | null>(null);
   const [nonce, setNonce] = useState(0);
   const key = `${printerId}:${nonce}`;
 
   useEffect(() => {
     const ctrl = new AbortController();
-    client()
+    getApiClient()
       .getPrinter(printerId, ctrl.signal)
       .then(
         (printer) =>
@@ -33,9 +33,7 @@ export function usePrinter(
           setSettled({ key, result: { phase: 'error', error } }),
       );
     return () => ctrl.abort();
-    // `client` is a stable accessor; re-fetch only on id or manual reload
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+  }, [key, printerId]);
 
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   // A result for an older key (id changed, reload pressed) counts as loading.

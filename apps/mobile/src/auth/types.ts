@@ -11,6 +11,8 @@ export interface SignableRequest {
 /** Produces the auth headers to merge into an API request. */
 export interface Authenticator {
   headers(request: SignableRequest): Promise<Record<string, string>>;
+  /** Drop cached credentials so the next call fetches fresh ones (after a 401/403). */
+  invalidate?(): void;
 }
 
 export interface KeyValueStore {

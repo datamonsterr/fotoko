@@ -11,9 +11,8 @@ describe('usePrinter', () => {
     const getPrinter = jest.fn(
       () => new Promise<typeof printer>((r) => (resolve = r)),
     );
-    const { result } = await renderHook(() =>
-      usePrinter('stand-001', () => ({ getPrinter }) as unknown as ApiClient),
-    );
+    setApiClient({ getPrinter } as unknown as ApiClient);
+    const { result } = await renderHook(() => usePrinter('stand-001'));
     expect(result.current.state.phase).toBe('loading');
     await act(async () => resolve(printer));
     await waitFor(() =>
@@ -32,9 +31,8 @@ describe('usePrinter', () => {
       .fn()
       .mockRejectedValueOnce(err)
       .mockImplementationOnce(() => new Promise((r) => (resolve = r)));
-    const { result } = await renderHook(() =>
-      usePrinter('p', () => ({ getPrinter }) as unknown as ApiClient),
-    );
+    setApiClient({ getPrinter } as unknown as ApiClient);
+    const { result } = await renderHook(() => usePrinter('p'));
     await waitFor(() =>
       expect(result.current.state).toEqual({ phase: 'error', error: err }),
     );
@@ -51,9 +49,9 @@ describe('usePrinter', () => {
       .fn()
       .mockImplementationOnce(() => new Promise((r) => (resolveFirst = r)))
       .mockResolvedValueOnce({ ...printer, printerId: 'b' });
+    setApiClient({ getPrinter } as unknown as ApiClient);
     const { result, rerender } = await renderHook(
-      ({ id }: { id: string }) =>
-        usePrinter(id, () => ({ getPrinter }) as unknown as ApiClient),
+      ({ id }: { id: string }) => usePrinter(id),
       { initialProps: { id: 'a' } },
     );
     await rerender({ id: 'b' });
@@ -70,9 +68,8 @@ describe('usePrinter', () => {
   it('ignores an aborted failure', async () => {
     let fail: (e: unknown) => void = () => {};
     const getPrinter = jest.fn(() => new Promise((_, rej) => (fail = rej)));
-    const { result, unmount } = await renderHook(() =>
-      usePrinter('a', () => ({ getPrinter }) as unknown as ApiClient),
-    );
+    setApiClient({ getPrinter } as unknown as ApiClient);
+    const { result, unmount } = await renderHook(() => usePrinter('a'));
     await unmount();
     await act(async () => fail(new Error('late')));
     expect(result.current.state.phase).toBe('loading');

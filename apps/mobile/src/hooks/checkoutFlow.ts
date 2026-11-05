@@ -2,6 +2,7 @@ import {
   ApiError,
   getApiClient,
   putPhoto,
+  serverClock,
   type ApiClient,
   type PresignedUpload,
 } from '@/api';
@@ -10,7 +11,14 @@ import { UPLOAD_CONCURRENCY } from '@/lib/limits';
 import type { DraftPhoto } from '@/lib/photos';
 
 export type FlowPhase =
-  'idle' | 'creating' | 'uploading' | 'checkingOut' | 'redirected' | 'error';
+  | 'idle'
+  | 'creating'
+  | 'uploading'
+  | 'checkingOut'
+  | 'redirected'
+  /** The order or a presigned URL ran out; `restart()` makes a new order from the same photos. */
+  | 'expired'
+  | 'error';
 
 export interface PhotoUploadState {
   status: 'pending' | 'uploading' | 'done' | 'error';
@@ -32,25 +40,45 @@ export interface CheckoutFlowDeps {
   upload?: (args: UploadArgs) => Promise<void>;
   /** Called with the payOS URL once checkout succeeded. */
   onCheckout: (checkoutUrl: string, orderId: string) => void | Promise<void>;
+  /** Server-corrected clock; defaults to the `Date`-header offset estimate. */
   now?: () => number;
 }
 
+/** A URL expiring within this window counts as expired: the PUT would likely fail midway. */
+export const EXPIRY_MARGIN_MS = 30_000;
+
 const pending = (): PhotoUploadState => ({ status: 'pending', progress: 0 });
+
+/** One generation of work. Disposing aborts it and makes every callback of it a no-op. */
+interface Run {
+  ctrl: AbortController;
+}
 
 /**
  * create order -> PUT each photo (bounded concurrency, per-photo retry) -> checkout -> onCheckout.
  * Every step is safe to re-run: an existing order and finished uploads are kept.
+ *
+ * Lifecycle: `dispose()` (unmount) aborts in-flight uploads and silences everything started
+ * before it; `arm()` makes the same instance usable again (React StrictMode runs effect
+ * cleanups and re-runs the effects on the same instance).
  */
 export class CheckoutFlow {
   private snapshot: FlowState;
-  private order: { id: string; uploads: PresignedUpload[] } | null = null;
-  private busy = false;
+  private order: {
+    id: string;
+    uploads: PresignedUpload[];
+    expiresAt: string;
+  } | null = null;
+  private orderPromise: Promise<void> | undefined;
+  private disposed = false;
+  private run: Run = { ctrl: new AbortController() };
+  private running: Run | null = null;
   private listeners = new Set<() => void>();
 
   constructor(
     private readonly printerId: string,
     private readonly draft: readonly DraftPhoto[],
-    private readonly deps: CheckoutFlowDeps,
+    private deps: CheckoutFlowDeps,
   ) {
     this.snapshot = {
       phase: 'idle',
@@ -60,6 +88,11 @@ export class CheckoutFlow {
     };
   }
 
+  /** Swap deps (latest callbacks) without recreating the flow. */
+  setDeps(deps: CheckoutFlowDeps): void {
+    this.deps = deps;
+  }
+
   subscribe = (fn: () => void): (() => void) => {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
@@ -67,134 +100,215 @@ export class CheckoutFlow {
 
   getState = (): FlowState => this.snapshot;
 
-  private set(patch: Partial<FlowState>) {
+  /** Re-enable after `dispose()`. No-op when not disposed. */
+  arm = (): void => {
+    if (!this.disposed) return;
+    this.disposed = false;
+    this.run = { ctrl: new AbortController() };
+  };
+
+  /** Abort in-flight uploads; nothing started before this changes state or calls onCheckout. */
+  dispose = (): void => {
+    this.disposed = true;
+    this.run.ctrl.abort();
+    this.running = null;
+  };
+
+  private live(run: Run): boolean {
+    return !this.disposed && this.run === run;
+  }
+
+  private set(run: Run, patch: Partial<FlowState>) {
+    if (!this.live(run)) return;
     this.snapshot = { ...this.snapshot, ...patch };
     this.listeners.forEach((l) => l());
   }
 
-  private setPhoto(i: number, s: PhotoUploadState) {
-    this.set({ photos: this.snapshot.photos.map((p, j) => (j === i ? s : p)) });
+  private setPhoto(run: Run, i: number, s: PhotoUploadState) {
+    this.set(run, {
+      photos: this.snapshot.photos.map((p, j) => (j === i ? s : p)),
+    });
   }
 
   private allDone(): boolean {
     return this.snapshot.photos.every((p) => p.status === 'done');
   }
 
+  private now(): number {
+    return (this.deps.now ?? serverClock.now)();
+  }
+
+  private runOut(iso: string): boolean {
+    return Date.parse(iso) - this.now() < EXPIRY_MARGIN_MS;
+  }
+
   /** Start, or resume after an error: only the missing steps run again. */
   start = (): void => {
-    void this.guarded(async () => {
-      if (this.draft.length === 0) return;
-      this.set({ error: null });
-      if (!this.order && !(await this.createOrder())) return;
-      this.set({ phase: 'uploading' });
-      await this.uploadAll();
-      await this.afterUploads();
-    });
+    void this.guarded((run) => this.runAll(run));
   };
 
   retryPhoto = (index: number): void => {
-    void this.guarded(async () => {
-      this.set({ phase: 'uploading', error: null });
-      await this.uploadOne(index);
-      await this.afterUploads();
+    void this.guarded(async (run) => {
+      this.set(run, { phase: 'uploading', error: null });
+      await this.uploadOne(run, index);
+      await this.afterUploads(run);
     });
   };
 
-  private async guarded(fn: () => Promise<void>): Promise<void> {
-    if (this.busy) return;
-    this.busy = true;
+  /** After `expired`: cancel the old order (best effort) and begin a new one with the same photos. */
+  restart = (): void => {
+    void this.guarded(async (run) => {
+      const old = this.order;
+      this.order = null;
+      this.orderPromise = undefined;
+      this.set(run, {
+        orderId: null,
+        error: null,
+        photos: this.draft.map(pending),
+      });
+      if (old) {
+        const { client = getApiClient } = this.deps;
+        void client()
+          .cancelOrder(old.id)
+          .catch(() => {});
+      }
+      await this.runAll(run);
+    });
+  };
+
+  private async guarded(fn: (run: Run) => Promise<void>): Promise<void> {
+    const run = this.run;
+    if (this.disposed || this.running === run) return;
+    this.running = run;
     try {
-      await fn();
+      await fn(run);
     } finally {
-      this.busy = false;
+      if (this.running === run) this.running = null;
     }
   }
 
-  private async createOrder(): Promise<boolean> {
+  private async runAll(run: Run): Promise<void> {
+    if (this.draft.length === 0) return;
+    this.set(run, { error: null });
+    if (!this.order && !(await this.createOrder(run))) return;
+    this.set(run, { phase: 'uploading' });
+    await this.uploadAll(run);
+    await this.afterUploads(run);
+  }
+
+  private async createOrder(run: Run): Promise<boolean> {
     const { client = getApiClient } = this.deps;
-    this.set({ phase: 'creating' });
-    try {
-      const res = await client().createOrder({
+    this.set(run, { phase: 'creating' });
+    // Shared across generations so a StrictMode remount reuses the in-flight create.
+    this.orderPromise ??= client()
+      .createOrder({
         printerId: this.printerId,
         photos: this.draft.map((p) => ({
           contentType: p.contentType,
           sizeBytes: p.sizeBytes,
           copies: p.copies,
         })),
-      });
-      this.order = { id: res.orderId, uploads: res.uploads };
-      this.set({ orderId: res.orderId });
-      return true;
+      })
+      .then(
+        (res) => {
+          this.order = {
+            id: res.orderId,
+            uploads: res.uploads,
+            expiresAt: res.expiresAt,
+          };
+        },
+        (e: unknown) => {
+          this.orderPromise = undefined;
+          throw e;
+        },
+      );
+    try {
+      await this.orderPromise;
     } catch (error) {
-      this.set({ phase: 'error', error });
+      this.set(run, { phase: 'error', error });
       return false;
     }
+    if (!this.live(run) || !this.order) return false;
+    this.set(run, { orderId: this.order.id });
+    return true;
   }
 
-  private async uploadOne(i: number): Promise<void> {
+  private async uploadOne(run: Run, i: number): Promise<void> {
     const photo = this.draft[i];
-    if (!photo || !this.order) return;
+    if (!photo || !this.order || !this.live(run)) return;
     const target = this.order.uploads[i];
     if (!target) {
-      this.setPhoto(i, {
+      this.setPhoto(run, i, {
         status: 'error',
         progress: 0,
         error: new ApiError('invalid_response', 'no upload slot'),
       });
       return;
     }
-    const { upload = putPhoto, now = Date.now } = this.deps;
-    if (Date.parse(target.expiresAt) <= now()) {
-      this.setPhoto(i, {
+    if (this.runOut(target.expiresAt) || this.runOut(this.order.expiresAt)) {
+      this.setPhoto(run, i, {
         status: 'error',
         progress: 0,
-        error: new Error('upload url expired'),
+        error: new ApiError('expired', 'upload url expired'),
       });
       return;
     }
-    this.setPhoto(i, { status: 'uploading', progress: 0 });
+    const { upload = putPhoto } = this.deps;
+    this.setPhoto(run, i, { status: 'uploading', progress: 0 });
     try {
       await upload({
         url: target.url,
         headers: target.headers,
         uri: photo.uri,
         contentType: photo.contentType,
+        signal: run.ctrl.signal,
         onProgress: (progress) =>
-          this.setPhoto(i, { status: 'uploading', progress }),
+          this.setPhoto(run, i, { status: 'uploading', progress }),
       });
-      this.setPhoto(i, { status: 'done', progress: 1 });
+      this.setPhoto(run, i, { status: 'done', progress: 1 });
     } catch (error) {
-      this.setPhoto(i, { status: 'error', progress: 0, error });
+      this.setPhoto(run, i, { status: 'error', progress: 0, error });
     }
   }
 
-  private async uploadAll(): Promise<void> {
+  private async uploadAll(run: Run): Promise<void> {
     const todo = this.snapshot.photos.flatMap((p, i) =>
       p.status === 'done' ? [] : [i],
     );
     let next = 0;
     const worker = async () => {
-      while (next < todo.length) await this.uploadOne(todo[next++] as number);
+      while (next < todo.length && this.live(run)) {
+        await this.uploadOne(run, todo[next++] as number);
+      }
     };
     await Promise.all(
       Array.from({ length: Math.min(UPLOAD_CONCURRENCY, todo.length) }, worker),
     );
   }
 
-  private async afterUploads(): Promise<void> {
+  private async afterUploads(run: Run): Promise<void> {
+    if (!this.live(run)) return;
     const order = this.order;
     if (!order || !this.allDone()) {
-      this.set({ phase: 'error' });
+      const expired = this.snapshot.photos.some(
+        (p) => p.error instanceof ApiError && p.error.code === 'expired',
+      );
+      this.set(run, { phase: expired ? 'expired' : 'error' });
+      return;
+    }
+    if (this.runOut(order.expiresAt)) {
+      this.set(run, { phase: 'expired' });
       return;
     }
     const { client = getApiClient, onCheckout } = this.deps;
-    this.set({ phase: 'checkingOut' });
+    this.set(run, { phase: 'checkingOut' });
     try {
       const res = await client().checkout(order.id);
-      this.set({ phase: 'redirected' });
+      if (!this.live(run)) return;
+      this.set(run, { phase: 'redirected' });
       await onCheckout(res.checkoutUrl, order.id);
     } catch (error) {
-      this.set({ phase: 'error', error });
+      this.set(run, { phase: 'error', error });
     }
   }
 }
