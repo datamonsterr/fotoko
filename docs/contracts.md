@@ -36,7 +36,9 @@ Errors: `{"error":{"code":"<snake_case>","message":"..."}}`. Codes: `not_found`,
 | `POST /v1/orders/{orderId}/cancel`   | -                                                                                  | `200 Order`; only before `paid`                                                                                        |
 | `POST /v1/payments/payos/webhook`    | payOS webhook body                                                                 | `200 {"success":true}`; bad signature -> `400 validation`                                                              |
 
-Validation: 1..=10 photos, copies 1..=5 each, sizeBytes 1..=15 MiB, printer must be `online`. `amountVnd = sum(copies) * pricePerPrintVnd`. Order expires 15 min after creation unless paid. Webhook is idempotent (repeat delivery of a paid order is a no-op returning success).
+Validation: 1..=10 photos, copies 1..=5 each, sizeBytes 1..=15 MiB, printer must be `online`. `amountVnd = sum(copies) * pricePerPrintVnd`. Order expires 15 min after creation unless paid. `uploads[i]` corresponds to request `photos[i]` (same order).
+
+Webhook handling (all return `200 {"success":true}` unless noted): paid -> order `paid` + job published; duplicate while `paid` -> job republished with the same `jobId` (Pi dedupes); duplicate after `printing` -> no-op; signed `data.code != "00"` -> no-op; payment for a `cancelled`/`expired` order -> no-op, logged at warn for manual refund (late payment); unknown `orderCode` -> no-op (payOS sends a sample on webhook URL confirmation); bad signature or missing `data.code` -> `400 validation`; amount mismatch -> `400 validation`, order unchanged.
 
 `Order`: `{orderId, printerId, status, amountVnd, orderCode?, photos:[{photoId,copies,contentType,uploaded}], createdAt, updatedAt, expiresAt, error?:{code,message}}` (RFC 3339 times).
 
@@ -56,7 +58,7 @@ Any other transition is rejected with `conflict`.
 Check current docs before coding (payos.vn docs, `payOSHQ` SDKs). Expected:
 
 - Create link: `POST {PAYOS_BASE_URL}/v2/payment-requests`, headers `x-client-id`, `x-api-key`; body `orderCode, amount, description (<=25 chars), cancelUrl, returnUrl, signature`. `signature = HMAC_SHA256(checksumKey, "amount=..&cancelUrl=..&description=..&orderCode=..&returnUrl=..")` hex.
-- Webhook: `{code, desc, success, data:{orderCode, amount, ...}, signature}`; `signature = HMAC_SHA256(checksumKey, data keys sorted alphabetically joined as k=v&...)`. `code == "00"` means paid. Amount must equal order amount.
+- Webhook: `{code, desc, success, data:{orderCode, amount, ...}, signature}`; `signature = HMAC_SHA256(checksumKey, data keys sorted alphabetically joined as k=v&...)`. The paid decision uses the signed `data.code == "00"` (the outer `code` is unsigned and only cross-checked). Null values sign as empty strings. Amount must equal order amount.
 - `returnUrl`/`cancelUrl`: `{PUBLIC_APP_URL}/orders/{orderId}`.
 
 ## MQTT (AWS IoT Core; local: embedded `rumqttd` or mosquitto)
@@ -87,11 +89,11 @@ S3 (`BUCKET_NAME`): `orders/{orderId}/{photoId}.{jpg|png}`. Lifecycle: delete af
 
 ## Lambda binaries (`crates/api`)
 
-| bin                 | trigger                                                                                    | build output                                |
-| ------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------- |
-| `fotoko-http`       | API Gateway HTTP API                                                                       | `target/lambda/fotoko-http/bootstrap`       |
-| `fotoko-iot-status` | IoT rule `SELECT *, topic(3) AS printerId FROM 'fotoko/printers/+/+'` (status + heartbeat) | `target/lambda/fotoko-iot-status/bootstrap` |
-| `fotoko-local`      | local dev / e2e server (not deployed)                                                      | cargo bin                                   |
+| bin                 | trigger                                                                                                                   | build output                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `fotoko-http`       | API Gateway HTTP API                                                                                                      | `target/lambda/fotoko-http/bootstrap`       |
+| `fotoko-iot-status` | IoT rule `SELECT *, topic(3) AS printerId FROM 'fotoko/printers/+/+' WHERE topic(4) = 'status' OR topic(4) = 'heartbeat'` | `target/lambda/fotoko-iot-status/bootstrap` |
+| `fotoko-local`      | local dev / e2e server (not deployed)                                                                                     | cargo bin                                   |
 
 Built with `cargo lambda build --release --arm64`. CDK reads `FOTOKO_LAMBDA_DIR` (default `<repo>/target/lambda`).
 

@@ -1,0 +1,18 @@
+# Offline printer: the stand shows why it cannot print and offers no way to start an order.
+# Needs a printer "stand-offline" registered with status offline. Not run in CI.
+appId: vn.fotoko.app
+---
+- launchApp:
+    clearState: true
+- openLink: fotoko://p/stand-offline
+- extendedWaitUntil:
+    visible:
+      id: printer-status
+    timeout: 15000
+- assertVisible: 'Máy in đang ngoại tuyến'
+- assertNotVisible:
+    id: printer-pick-button
+- tapOn:
+    id: printer-retry
+- assertVisible:
+    id: printer-status

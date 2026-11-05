@@ -1,0 +1,21 @@
+# Android photo picker and iOS PHPicker both show a grid; tap the first thumbnail, then confirm.
+appId: vn.fotoko.app
+---
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          point: '20%,30%'
+      - tapOn:
+          text: '(Add|Thêm|Done|Xong)'
+          optional: true
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          point: '20%,30%'
+      - tapOn:
+          text: '(Add|Thêm|Done|Xong)'
+          optional: true

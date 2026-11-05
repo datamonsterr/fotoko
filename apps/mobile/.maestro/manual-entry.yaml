@@ -1,0 +1,22 @@
+# Home -> manual printer id entry, including validation. Not run in CI.
+appId: vn.fotoko.app
+---
+- launchApp:
+    clearState: true
+- assertVisible:
+    id: home-screen
+- tapOn:
+    id: home-printer-input
+- inputText: 'bad/id'
+- tapOn:
+    id: home-printer-go
+- assertVisible:
+    id: home-printer-error
+- eraseText: 6
+- inputText: 'stand-001'
+- tapOn:
+    id: home-printer-go
+- extendedWaitUntil:
+    visible:
+      id: printer-screen
+    timeout: 15000
