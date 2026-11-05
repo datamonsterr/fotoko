@@ -1,0 +1,57 @@
+[package]
+name = "fotoko-api"
+description = "Fotoko backend: axum HTTP API, Lambda bins, AWS adapters and the local server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fotoko-http"
+path = "src/bin/fotoko-http.rs"
+
+[[bin]]
+name = "fotoko-iot-status"
+path = "src/bin/fotoko-iot-status.rs"
+
+[[bin]]
+name = "fotoko-local"
+path = "src/bin/fotoko-local.rs"
+
+[dependencies]
+async-trait = "=0.1.92"
+aws-config = { version = "=1.13.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-dynamodb = { version = "=1.137.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-iotdataplane = { version = "=1.120.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "http-1x"] }
+aws-sdk-secretsmanager = { version = "=1.125.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-smithy-types = "1"
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "query", "json"] }
+chrono.workspace = true
+fotoko-core = { workspace = true, features = ["testing"] }
+fotoko-protocol.workspace = true
+hex = "0.4"
+hmac = "=0.13.0"
+lambda_http = { version = "=1.3.2", default-features = false, features = ["apigw_http"] }
+lambda_runtime = "=1.5.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+rumqttc = { version = "=0.25.1", default-features = false, features = ["url"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.11.1"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+rumqttd = "=0.20.0"
+tempfile = "3"
+tower = { version = "=0.5.3", features = ["util"] }
+wiremock = "=0.6.5"
+
+[lints]
+workspace = true
