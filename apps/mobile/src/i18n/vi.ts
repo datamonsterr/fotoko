@@ -22,7 +22,7 @@ export const vi = {
   'printer.media': 'Khổ giấy: {media}',
   'printer.status.online': 'Sẵn sàng',
   'printer.status.offline': 'Máy in đang ngoại tuyến',
-  'printer.status.busy': 'Máy in đang bận, vui lòng thử lại sau ít phút.',
+  'printer.status.busy': 'Máy đang in, ảnh của bạn sẽ được in tiếp theo.',
   'printer.status.error': 'Máy in đang gặp lỗi, vui lòng báo nhân viên.',
   'printer.pick': 'Chọn ảnh để in',
   'printer.refresh': 'Kiểm tra lại',

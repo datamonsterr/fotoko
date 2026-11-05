@@ -46,22 +46,74 @@ describe('PrinterScreen', () => {
 
   it.each([
     ['offline', 'Máy in đang ngoại tuyến'],
-    ['busy', 'Máy in đang bận, vui lòng thử lại sau ít phút.'],
     ['error', 'Máy in đang gặp lỗi, vui lòng báo nhân viên.'],
-  ] as const)('%s: no CTA, explains, can re-check', async (status, text) => {
-    const getPrinter = jest
-      .fn()
-      .mockResolvedValue({ ...printer, status } satisfies Printer);
-    await renderApp(
-      <PrinterScreen printerId="p" client={clientWith(getPrinter)} />,
-    );
-    await waitFor(() =>
-      expect(screen.getByTestId('printer-status')).toHaveTextContent(text),
-    );
-    expect(screen.queryByTestId('printer-pick-button')).toBeNull();
-    await fireEvent.press(screen.getByTestId('printer-retry'));
-    await waitFor(() => expect(getPrinter).toHaveBeenCalledTimes(2));
-  });
+  ] as const)(
+    '%s: blocks booking, explains, can re-check',
+    async (status, text) => {
+      const getPrinter = jest
+        .fn()
+        .mockResolvedValue({ ...printer, status } satisfies Printer);
+      await renderApp(
+        <PrinterScreen printerId="p" client={clientWith(getPrinter)} />,
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId('printer-status')).toHaveTextContent(text),
+      );
+      expect(screen.queryByTestId('printer-pick-button')).toBeNull();
+      await fireEvent.press(screen.getByTestId('printer-retry'));
+      await waitFor(() => expect(getPrinter).toHaveBeenCalledTimes(2));
+    },
+  );
+
+  it.each([
+    ['vi', 'Máy đang in, ảnh của bạn sẽ được in tiếp theo.'],
+    ['en', 'Printer is busy, your photos will print next.'],
+  ] as const)(
+    'busy (%s): shows an info note and keeps the pick button',
+    async (locale, text) => {
+      const getPrinter = jest
+        .fn()
+        .mockResolvedValue({ ...printer, status: 'busy' } satisfies Printer);
+      await renderApp(
+        <PrinterScreen printerId="stand-001" client={clientWith(getPrinter)} />,
+        { locale },
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId('printer-status')).toHaveTextContent(text),
+      );
+      // informational, not an alert
+      expect(screen.getByTestId('printer-status').props.accessibilityRole).toBe(
+        'text',
+      );
+      expect(screen.getByTestId('printer-pick-button')).toBeEnabled();
+      expect(screen.queryByTestId('printer-retry')).toBeNull();
+      await fireEvent.press(screen.getByTestId('printer-pick-button'));
+      expect(router.push).toHaveBeenCalledWith({
+        pathname: '/p/[printerId]/photos',
+        params: { printerId: 'stand-001' },
+      });
+    },
+  );
+
+  it.each(['online', 'offline', 'error'] as const)(
+    '%s: status role and CTA match bookability',
+    async (status) => {
+      const getPrinter = jest.fn().mockResolvedValue({ ...printer, status });
+      await renderApp(
+        <PrinterScreen printerId="p" client={clientWith(getPrinter)} />,
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId('printer-status')).toBeOnTheScreen(),
+      );
+      const bookable = status === 'online';
+      expect(screen.queryByTestId('printer-pick-button') !== null).toBe(
+        bookable,
+      );
+      expect(screen.getByTestId('printer-status').props.accessibilityRole).toBe(
+        bookable ? 'text' : 'alert',
+      );
+    },
+  );
 
   it('English copy', async () => {
     await renderApp(

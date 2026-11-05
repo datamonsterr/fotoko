@@ -26,18 +26,18 @@ Stable `testID`s for Maestro and Playwright. Rename only together with the flows
 
 ## Printer `/p/[printerId]`
 
-| testID                | Element                                             |
-| --------------------- | --------------------------------------------------- |
-| `printer-screen`      | Screen                                              |
-| `printer-loading`     | Spinner                                             |
-| `printer-name`        | Printer name                                        |
-| `printer-price`       | Price per print, VND formatted                      |
-| `printer-status`      | Status text (`online`, `offline`, `busy`, `error`)  |
-| `printer-pick-button` | Start picking photos (only when online)             |
-| `printer-retry`       | Re-check the printer (not online) or retry on error |
-| `printer-error`       | Load error box                                      |
-| `printer-not-found`   | Unknown printer message                             |
-| `printer-home`        | Back to home from an error                          |
+| testID                | Element                                                    |
+| --------------------- | ---------------------------------------------------------- |
+| `printer-screen`      | Screen                                                     |
+| `printer-loading`     | Spinner                                                    |
+| `printer-name`        | Printer name                                               |
+| `printer-price`       | Price per print, VND formatted                             |
+| `printer-status`      | Status text; `busy` is an info note (still bookable)       |
+| `printer-pick-button` | Start picking photos (only when online)                    |
+| `printer-retry`       | Re-check the printer (`offline`/`error`) or retry on error |
+| `printer-error`       | Load error box                                             |
+| `printer-not-found`   | Unknown printer message                                    |
+| `printer-home`        | Back to home from an error                                 |
 
 ## Photos `/p/[printerId]/photos`
 

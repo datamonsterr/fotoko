@@ -24,8 +24,7 @@ export const en: Record<MessageKey, string> = {
   'printer.media': 'Paper: {media}',
   'printer.status.online': 'Ready',
   'printer.status.offline': 'The printer is offline',
-  'printer.status.busy':
-    'The printer is busy, please try again in a few minutes.',
+  'printer.status.busy': 'Printer is busy, your photos will print next.',
   'printer.status.error': 'The printer has a problem, please tell the staff.',
   'printer.pick': 'Choose photos to print',
   'printer.refresh': 'Check again',
