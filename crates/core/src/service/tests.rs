@@ -1172,3 +1172,183 @@ fn config_defaults_and_debug_redaction() {
     assert!(shown.contains("<redacted>"));
     assert_eq!(format!("{:?}", harness().service.ports), "Ports { .. }");
 }
+
+// ---- error propagation ----
+
+fn boom() -> CoreError {
+    CoreError::Internal("boom".into())
+}
+
+#[tokio::test]
+async fn webhook_for_awaiting_upload_order_conflicts() {
+    let h = harness();
+    let id = uploaded(&h).await;
+    // Give the order a code without going through checkout.
+    let mut order = h.orders.snapshot(&id).expect("stored");
+    order.order_code = Some(777);
+    h.orders
+        .update(&order, OrderStatus::AwaitingUpload)
+        .await
+        .expect("seed");
+    let err = pay(&h, 777, 50_000).await.expect_err("not checked out");
+    assert!(matches!(err, CoreError::Conflict(_)));
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingUpload);
+    assert!(h.publisher.jobs().is_empty());
+}
+
+#[tokio::test]
+async fn get_printer_propagates_repo_errors() {
+    let h = harness();
+    h.printers.fail_with("get", Some(boom()));
+    assert_eq!(h.service.get_printer(&pid()).await, Err(boom()));
+}
+
+#[tokio::test]
+async fn create_order_propagates_port_errors() {
+    let h = harness();
+    h.printers.fail_with("get", Some(boom()));
+    assert_eq!(
+        h.service.create_order(OWNER, &two_photos()).await,
+        Err(boom())
+    );
+    h.printers.fail_with("get", None);
+
+    h.store.fail_with("presign_put", Some(boom()));
+    assert_eq!(
+        h.service.create_order(OWNER, &two_photos()).await,
+        Err(boom())
+    );
+    h.store.fail_with("presign_put", None);
+
+    h.orders.fail_with("insert", Some(boom()));
+    assert_eq!(
+        h.service.create_order(OWNER, &two_photos()).await,
+        Err(boom())
+    );
+    h.orders.fail_with("insert", None);
+    assert!(h.orders.all().is_empty());
+
+    assert!(h.service.create_order(OWNER, &two_photos()).await.is_ok());
+}
+
+#[tokio::test]
+async fn checkout_propagates_port_errors() {
+    let h = harness();
+    let id = uploaded(&h).await;
+
+    h.orders.fail_with("get", Some(boom()));
+    assert_eq!(h.service.checkout(OWNER, &id).await, Err(boom()));
+    h.orders.fail_with("get", None);
+
+    h.store.fail_with("exists", Some(boom()));
+    assert_eq!(h.service.checkout(OWNER, &id).await, Err(boom()));
+    h.store.fail_with("exists", None);
+
+    h.orders.fail_with("get_by_order_code", Some(boom()));
+    assert_eq!(h.service.checkout(OWNER, &id).await, Err(boom()));
+    h.orders.fail_with("get_by_order_code", None);
+
+    h.orders.fail_with("update", Some(boom()));
+    assert_eq!(h.service.checkout(OWNER, &id).await, Err(boom()));
+    h.orders.fail_with("update", None);
+
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingUpload);
+    assert!(h.service.checkout(OWNER, &id).await.is_ok());
+}
+
+#[tokio::test]
+async fn get_order_propagates_port_errors() {
+    let h = harness();
+    let created = create(&h).await;
+    h.orders.fail_with("get", Some(boom()));
+    assert_eq!(
+        h.service.get_order(OWNER, &created.order_id).await,
+        Err(boom())
+    );
+    h.orders.fail_with("get", None);
+
+    h.store.fail_with("exists", Some(boom()));
+    assert_eq!(
+        h.service.get_order(OWNER, &created.order_id).await,
+        Err(boom())
+    );
+    h.store.fail_with("exists", None);
+    assert!(h.service.get_order(OWNER, &created.order_id).await.is_ok());
+}
+
+#[tokio::test]
+async fn cancel_propagates_port_errors() {
+    let h = harness();
+    let id = uploaded(&h).await;
+    h.orders.fail_with("get", Some(boom()));
+    assert_eq!(h.service.cancel(OWNER, &id).await, Err(boom()));
+    h.orders.fail_with("get", None);
+
+    h.orders.fail_with("update", Some(boom()));
+    assert_eq!(h.service.cancel(OWNER, &id).await, Err(boom()));
+    h.orders.fail_with("update", None);
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingUpload);
+}
+
+#[tokio::test]
+async fn webhook_propagates_port_errors() {
+    let h = harness();
+    let (id, code) = awaiting_payment(&h).await;
+
+    h.orders.fail_with("get_by_order_code", Some(boom()));
+    assert_eq!(pay(&h, code, 50_000).await, Err(boom()));
+    h.orders.fail_with("get_by_order_code", None);
+
+    h.orders.fail_with("update", Some(boom()));
+    assert_eq!(pay(&h, code, 50_000).await, Err(boom()));
+    h.orders.fail_with("update", None);
+    assert_eq!(status_of(&h, &id), OrderStatus::AwaitingPayment);
+
+    // presign_get fails while building the job: the order is paid, nothing is published.
+    h.store.fail_with("presign_get", Some(boom()));
+    assert_eq!(pay(&h, code, 50_000).await, Err(boom()));
+    assert_eq!(status_of(&h, &id), OrderStatus::Paid);
+    // Same failure on the duplicate-while-paid republish path.
+    assert_eq!(pay(&h, code, 50_000).await, Err(boom()));
+    assert!(h.publisher.jobs().is_empty());
+
+    h.store.fail_with("presign_get", None);
+    assert_eq!(pay(&h, code, 50_000).await, Ok(WebhookOutcome::Duplicate));
+    assert_eq!(h.publisher.jobs().len(), 1);
+}
+
+#[tokio::test]
+async fn job_status_propagates_port_errors() {
+    let h = harness();
+    let id = paid(&h).await;
+    let report = job_status(&id, JobState::Printing, None);
+
+    h.orders.fail_with("get", Some(boom()));
+    assert_eq!(h.service.handle_job_status(&report).await, Err(boom()));
+    h.orders.fail_with("get", None);
+
+    h.orders.fail_with("update", Some(boom()));
+    assert_eq!(h.service.handle_job_status(&report).await, Err(boom()));
+    h.orders.fail_with("update", None);
+    assert_eq!(status_of(&h, &id), OrderStatus::Paid);
+}
+
+#[tokio::test]
+async fn heartbeat_propagates_repo_errors() {
+    let h = harness();
+    h.printers.fail_with("update_status", Some(boom()));
+    let beat = Heartbeat {
+        printer_id: pid(),
+        printer_state: PrinterState::Idle,
+        agent_version: "0.1.0".into(),
+        at: ts("2026-01-01T00:00:00Z"),
+    };
+    assert_eq!(h.service.handle_heartbeat(&beat).await, Err(boom()));
+}
+
+#[tokio::test]
+async fn expire_due_propagates_listing_errors() {
+    let h = harness();
+    h.orders.fail_with("list_due_for_expiry", Some(boom()));
+    assert_eq!(h.service.expire_due().await, Err(boom()));
+}
