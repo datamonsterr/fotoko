@@ -78,12 +78,13 @@ Status mapping (cloud): `received|printing` -> order `printing`; `completed` -> 
 
 ## DynamoDB (single table, `TABLE_NAME`)
 
-| Item    | pk                    | sk     | attrs                                                                                                                        |
-| ------- | --------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| Printer | `PRINTER#{printerId}` | `META` | name, pricePerPrintVnd, status, lastSeenAt                                                                                   |
-| Order   | `ORDER#{orderId}`     | `META` | printerId, owner, status, amountVnd, orderCode, photos, createdAt, updatedAt, expiresAt, ttl, gsi1pk=`ORDERCODE#{orderCode}` |
+| Item                   | pk                      | sk     | attrs                                                                                                                        |
+| ---------------------- | ----------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| Printer                | `PRINTER#{printerId}`   | `META` | name, pricePerPrintVnd, status, lastSeenAt                                                                                   |
+| Order                  | `ORDER#{orderId}`       | `META` | printerId, owner, status, amountVnd, orderCode, photos, createdAt, updatedAt, expiresAt, ttl, gsi1pk=`ORDERCODE#{orderCode}` |
+| Order code reservation | `ORDERCODE#{orderCode}` | `META` | orderId, ttl (written in the same transaction that first sets the code; enforces uniqueness)                                 |
 
-GSI `gsi1` on `gsi1pk` (webhook lookup). Status updates use conditional writes on the expected current status.
+GSI `gsi1` on `gsi1pk` (kept; webhook lookup reads the reservation item with a consistent read instead). GSI `gsi2` (`gsi2pk = "DUE"`, `gsi2sk = expiresAt` fixed-width RFC 3339) is set only while an order is `awaiting_*` and drives the expiry sweep. `ttl` = expiresAt + 7 days. Status updates use conditional writes on the expected current status.
 
 S3 (`BUCKET_NAME`): `orders/{orderId}/{photoId}.{jpg|png}`. Lifecycle: delete after 7 days.
 
@@ -93,7 +94,8 @@ S3 (`BUCKET_NAME`): `orders/{orderId}/{photoId}.{jpg|png}`. Lifecycle: delete af
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
 | `fotoko-http`       | API Gateway HTTP API                                                                                                      | `target/lambda/fotoko-http/bootstrap`       |
 | `fotoko-iot-status` | IoT rule `SELECT *, topic(3) AS printerId FROM 'fotoko/printers/+/+' WHERE topic(4) = 'status' OR topic(4) = 'heartbeat'` | `target/lambda/fotoko-iot-status/bootstrap` |
-| `fotoko-local`      | local dev / e2e server (not deployed)                                                                                     | cargo bin                                   |
+| `fotoko-expire`     | EventBridge `rate(5 minutes)`, reserved concurrency 1                                                                     | `target/lambda/fotoko-expire/bootstrap`     |
+| `fotoko-local`      | local dev / e2e server, cargo feature `local` (not deployed)                                                              | cargo bin                                   |
 
 Built with `cargo lambda build --release --arm64`. CDK reads `FOTOKO_LAMBDA_DIR` (default `<repo>/target/lambda`).
 

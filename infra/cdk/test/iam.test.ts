@@ -60,38 +60,68 @@ describe('no broad IAM', () => {
 });
 
 describe('Lambda roles', () => {
-  it('limits fotoko-http to four item actions on the table and gsi1', () => {
-    const statements = byAction('dynamodb:PutItem');
-    const { statement, roles } = one(statements);
-    expect(actionsOf(statement).sort()).toEqual([
-      'dynamodb:GetItem',
-      'dynamodb:PutItem',
-      'dynamodb:Query',
-      'dynamodb:UpdateItem',
-    ]);
-    const resources = asArray(statement.Resource as unknown[]);
-    expect(resources).toHaveLength(2);
-    expect(json(resources[0])).toContain('DataTable');
-    expect(json(resources[1])).toContain('/index/gsi1');
-    expect(json(roles)).toContain('HttpRole');
+  /** Statements of one Lambda role (log permissions excluded), as `actions @ resource tags`. */
+  const roleGrants = (role: string): string[] =>
+    all
+      .filter(({ roles }) => json(roles).includes(role))
+      .filter(
+        ({ statement }) => !actionsOf(statement).includes('logs:PutLogEvents'),
+      )
+      .map(({ statement }) => {
+        const tags = asArray(statement.Resource as unknown[]).map((r) => {
+          const text = json(r);
+          if (text.includes('DataTable'))
+            return text.includes('/index/gsi2') ? 'table/index/gsi2' : 'table';
+          if (text.includes('DataPhotosBucket'))
+            return text.includes('/orders/*') ? 'bucket/orders/*' : 'bucket';
+          if (text.includes(':topic/fotoko/printers/*/jobs'))
+            return 'iot-jobs-topics';
+          if (text.includes('DataPayosSecret')) return 'payos-secret';
+          return text;
+        });
+        const condition =
+          statement.Condition === undefined ? '' : ' if condition';
+        return `${actionsOf(statement).sort().join(',')} @ ${tags.join(',')}${condition}`;
+      })
+      .sort();
+
+  it('gives fotoko-http exactly: item actions on the table, Query on gsi2 only, S3 orders/, iot jobs, payOS secret', () => {
+    expect(roleGrants('HttpRole')).toEqual(
+      [
+        'dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem @ table',
+        'dynamodb:Query @ table/index/gsi2',
+        's3:GetObject,s3:PutObject @ bucket/orders/*',
+        's3:ListBucket @ bucket',
+        'iot:Publish @ iot-jobs-topics',
+        'secretsmanager:GetSecretValue @ payos-secret',
+      ].sort(),
+    );
   });
 
-  it('limits fotoko-iot-status to get, update and query on the table only', () => {
-    const { statement, roles } = one(
-      byAction('dynamodb:GetItem').filter(({ roles: r }) =>
-        json(r).includes('IotStatusRole'),
-      ),
-    );
-    expect(actionsOf(statement).sort()).toEqual([
-      'dynamodb:GetItem',
-      'dynamodb:Query',
-      'dynamodb:UpdateItem',
+  it('gives fotoko-iot-status exactly item actions on the table: no Query, S3, IoT or secrets', () => {
+    expect(roleGrants('IotStatusRole')).toEqual([
+      'dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem @ table',
     ]);
-    const resources = asArray(statement.Resource as unknown[]);
-    expect(resources).toHaveLength(1);
-    expect(json(resources[0])).toContain('DataTable');
-    expect(json(resources[0])).not.toContain('/index/');
-    expect(json(roles)).toContain('IotStatusRole');
+  });
+
+  it('gives fotoko-expire exactly item actions on the table and Query on gsi2', () => {
+    expect(roleGrants('ExpireRole')).toEqual(
+      [
+        'dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem @ table',
+        'dynamodb:Query @ table/index/gsi2',
+      ].sort(),
+    );
+  });
+
+  it('never grants Query on the table itself or gsi1, nor Delete/Scan/Batch/Transact actions', () => {
+    const all_ = all.flatMap(({ statement }) => actionsOf(statement));
+    expect(
+      all_.filter((a) => /dynamodb:(Delete|Scan|Batch|Transact)/.test(a)),
+    ).toEqual([]);
+    for (const { statement } of byAction('dynamodb:Query')) {
+      expect(json(statement.Resource)).toContain('/index/gsi2');
+      expect(json(statement.Resource)).not.toContain('gsi1');
+    }
   });
 
   it('gives only fotoko-http S3 object access, only under orders/', () => {
@@ -141,8 +171,8 @@ describe('Lambda roles', () => {
 
   it('writes logs only to its own log group', () => {
     const logs = byAction('logs:PutLogEvents');
-    // fotoko-http, fotoko-iot-status, IoT rule error logging, endpoint lookup provider.
-    expect(logs).toHaveLength(4);
+    // fotoko-http, fotoko-iot-status, fotoko-expire, IoT rule error logging, endpoint lookup provider.
+    expect(logs).toHaveLength(5);
     for (const { statement } of logs) {
       expect(actionsOf(statement).sort()).toEqual([
         'logs:CreateLogStream',
