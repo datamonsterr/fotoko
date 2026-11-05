@@ -18,6 +18,7 @@ import { Construct } from 'constructs';
 import type { StageConfig } from './config';
 
 export const GSI1 = 'gsi1';
+export const GSI2 = 'gsi2';
 /** S3 key prefix of order photos (`orders/{orderId}/{photoId}.{jpg|png}`). */
 export const ORDERS_PREFIX = 'orders/';
 
@@ -59,6 +60,12 @@ export class Data extends Construct {
     this.table.addGlobalSecondaryIndex({
       indexName: GSI1,
       partitionKey: { name: 'gsi1pk', type: AttributeType.STRING },
+      projectionType: ProjectionType.ALL,
+    });
+    this.table.addGlobalSecondaryIndex({
+      indexName: GSI2,
+      partitionKey: { name: 'gsi2pk', type: AttributeType.STRING },
+      sortKey: { name: 'gsi2sk', type: AttributeType.STRING },
       projectionType: ProjectionType.ALL,
     });
 

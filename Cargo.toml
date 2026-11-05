@@ -28,6 +28,7 @@ fotoko-protocol = { path = "crates/protocol" }
 fotoko-core = { path = "crates/core" }
 fotoko-printer-sim = { path = "crates/printer-sim" }
 fotoko-pi-agent = { path = "crates/pi-agent" }
+fotoko-api = { path = "crates/api" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
