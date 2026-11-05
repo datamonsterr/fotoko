@@ -14,6 +14,12 @@ services:
     command: ['-jar', 'DynamoDBLocal.jar', '-inMemory', '-sharedDb']
     ports:
       - '127.0.0.1:18000:8000'
+    # `up --wait` (scripts/ci/repro.sh) blocks on these.
+    healthcheck:
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/8000']
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   minio:
     # S3 stand-in. The official minio/minio image is only published to quay.io; this Bitnami
@@ -24,3 +30,8 @@ services:
       MINIO_ROOT_PASSWORD: fotoko-secret
     ports:
       - '127.0.0.1:19000:9000'
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:9000/minio/health/live']
+      interval: 2s
+      timeout: 3s
+      retries: 30

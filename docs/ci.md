@@ -54,7 +54,7 @@ Tools worth installing locally: `cargo install cargo-nextest cargo-deny --locked
 
 ## Deploy
 
-`.github/workflows/deploy.yml` deploys on push to `main` (stage `dev`) and on manual dispatch (stage `dev` or `prod`). It assumes the AWS role in `vars.AWS_DEPLOY_ROLE_ARN` through GitHub OIDC and runs `scripts/deploy/aws.sh <stage>`. Runs of one stage queue and are never cancelled.
+`.github/workflows/deploy.yml` deploys stage `dev` when the `CI` workflow completes successfully for a push to `main` (`workflow_run`, so a red `ci-ok` never deploys) and on manual dispatch (stage `dev` or `prod`). It assumes the AWS role in `vars.AWS_DEPLOY_ROLE_ARN` through GitHub OIDC and runs `scripts/deploy/aws.sh <stage>`. Runs of one stage queue and are never cancelled.
 
 Setup, once per AWS account:
 
@@ -64,4 +64,8 @@ Setup, once per AWS account:
 
 `scripts/deploy/aws.sh [--dry-run] <dev|prod>`: build the Lambdas (`cargo lambda build`), build the Expo web export with `EXPO_PUBLIC_*` from the environment or the stack outputs, `cdk deploy -c stage=<stage> -c deployWeb=true`, print the outputs. On the first deploy the stack has no outputs yet, so it is deployed once without web assets, then again with them. `--dry-run` prints every command and runs none.
 
-The deploy does not wait for `ci-ok` on the same commit. Protect `main` with the `ci-ok` required check so only green commits reach it.
+The deploy checks out the commit CI tested (`workflow_run.head_sha`). Also protect `main` with the `ci-ok` required check.
+
+## Dependency advisories
+
+`deny.toml` ignores six advisories (RUSTSEC-2026-0049, -0098, -0099, -0104, -0382, RUSTSEC-2025-0134). `rumqttc 0.25.1` and `rumqttd 0.20.0`, the latest releases on crates.io (checked 2026-11-05), still depend on `rustls-webpki 0.102.x` and `rustls-pemfile`. Tracking: re-check for a rumqttc release on `rustls-webpki >= 0.103.16` by 2027-02-05 (or sooner when Dependabot opens one), upgrade, and delete the ignore entries. Do not add new ignores without a reason and a review date.

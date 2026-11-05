@@ -73,7 +73,8 @@ job_rust_integration() {
     have_crate api || skip "crates/api does not exist yet"
     [ -f docker-compose.test.yml ] || skip "docker-compose.test.yml does not exist yet"
     need docker "Install Docker with the compose plugin."
-    local compose=(docker compose -f docker-compose.test.yml)
+    # Global: the EXIT trap runs after this function has returned.
+    compose=(docker compose -f docker-compose.test.yml)
     # shellcheck disable=SC2329 # invoked by the EXIT trap
     cleanup() {
         local code=$?
