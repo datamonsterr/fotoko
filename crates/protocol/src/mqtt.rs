@@ -4,13 +4,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::http::{ContentType, Media};
+use crate::ids::{JobId, OrderId, PhotoId, PrinterId};
 
 /// One photo to print inside a [`PrintJob`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobPhoto {
     /// Photo id.
-    pub photo_id: String,
+    pub photo_id: PhotoId,
     /// Presigned GET URL (15 minutes).
     pub url: String,
     /// Expected image format.
@@ -24,11 +25,11 @@ pub struct JobPhoto {
 #[serde(rename_all = "camelCase")]
 pub struct PrintJob {
     /// Job id (dedupe key on the Pi).
-    pub job_id: String,
+    pub job_id: JobId,
     /// Order id.
-    pub order_id: String,
+    pub order_id: OrderId,
     /// Target printer.
-    pub printer_id: String,
+    pub printer_id: PrinterId,
     /// Media size.
     pub media: Media,
     /// Creation time.
@@ -83,11 +84,11 @@ pub struct PiError {
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
     /// Job id.
-    pub job_id: String,
+    pub job_id: JobId,
     /// Order id.
-    pub order_id: String,
+    pub order_id: OrderId,
     /// Reporting printer.
-    pub printer_id: String,
+    pub printer_id: PrinterId,
     /// Job state.
     pub state: JobState,
     /// Copies printed so far.
@@ -118,7 +119,7 @@ pub enum PrinterState {
 #[serde(rename_all = "camelCase")]
 pub struct Heartbeat {
     /// Reporting printer.
-    pub printer_id: String,
+    pub printer_id: PrinterId,
     /// Printer state.
     pub printer_state: PrinterState,
     /// Agent version.

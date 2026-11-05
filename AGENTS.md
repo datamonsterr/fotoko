@@ -14,14 +14,14 @@ On-site pay-to-print photo kiosk. Customers scan a QR code at a Stand, upload ph
 | `deploy/pi`                                            | Pi provisioning and cross-build                        |
 | `scripts/ci`                                           | `fast.sh` and `all.sh`                                 |
 
-Cargo members are `crates/*`; pnpm packages are `apps/*`, `packages/*`, `infra/*`. New crates and packages need no root edits.
+Cargo members are `crates/*`; pnpm packages are `apps/*`, `packages/*`, `infra/*`. A new crate or package is picked up by the globs with no root edit, except that a crate other crates depend on needs a `path` entry in the root `[workspace.dependencies]`.
 
 ## Commands
 
 ```sh
 pnpm install                      # also installs lefthook git hooks
-bash scripts/ci/fast.sh           # changed-scope loop: fmt, clippy, tests, turbo lint/typecheck/test
-bash scripts/ci/all.sh            # everything CI runs
+bash scripts/ci/fast.sh           # changed scope: workspace clippy, tests of changed crates + their reverse deps, turbo, Prettier
+bash scripts/ci/all.sh            # everything CI runs (fmt, clippy, tests, doctests, cargo deny, turbo, Prettier)
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <crate>             # or `cargo nextest run -p <crate>` when installed
@@ -50,7 +50,7 @@ Test helpers must not do expensive per-process setup (key generation, big fixtur
 
 ## Rust rules
 
-Edition 2024, `thiserror` in libraries, no `unwrap`/`expect`/`panic!` outside tests (workspace lints enforce it), `cargo fmt` and `clippy -D warnings`, `cargo deny check` for dependencies. Share dependency versions through `[workspace.dependencies]` and `lints.workspace = true`.
+Edition 2024, `thiserror` in libraries, no `unwrap`/`expect`/`panic!` outside tests (workspace lints enforce it), `cargo fmt` and `clippy -D warnings`, `cargo deny check` for dependencies. Share dependency versions through `[workspace.dependencies]` and `lints.workspace = true`. The workspace lints warn on `print_stdout`/`print_stderr`; a binary that legitimately prints may add `#![allow(clippy::print_stdout, clippy::print_stderr)]`. Features such as chrono `clock` are not in the workspace default: a crate enables the ones it needs.
 
 ## Builds and disk
 

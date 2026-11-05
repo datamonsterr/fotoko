@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::ids::PrinterId;
+
 const PREFIX: &str = "fotoko/printers";
 
 /// Which of the three per-printer topics a topic names.
@@ -50,27 +52,27 @@ pub enum TopicError {
 }
 
 /// Topic for one printer and kind.
-pub fn topic(printer_id: &str, kind: TopicKind) -> String {
+pub fn topic(printer_id: &PrinterId, kind: TopicKind) -> String {
     format!("{PREFIX}/{printer_id}/{}", kind.as_str())
 }
 
 /// `fotoko/printers/{printer_id}/jobs`
-pub fn jobs_topic(printer_id: &str) -> String {
+pub fn jobs_topic(printer_id: &PrinterId) -> String {
     topic(printer_id, TopicKind::Jobs)
 }
 
 /// `fotoko/printers/{printer_id}/status`
-pub fn status_topic(printer_id: &str) -> String {
+pub fn status_topic(printer_id: &PrinterId) -> String {
     topic(printer_id, TopicKind::Status)
 }
 
 /// `fotoko/printers/{printer_id}/heartbeat`
-pub fn heartbeat_topic(printer_id: &str) -> String {
+pub fn heartbeat_topic(printer_id: &PrinterId) -> String {
     topic(printer_id, TopicKind::Heartbeat)
 }
 
 /// Split a topic into its printer id and kind.
-pub fn parse_topic(topic: &str) -> Result<(String, TopicKind), TopicError> {
+pub fn parse_topic(topic: &str) -> Result<(PrinterId, TopicKind), TopicError> {
     let segments: Vec<&str> = topic.split('/').collect();
     let [fotoko, printers, id, kind] = segments.as_slice() else {
         return Err(TopicError::Malformed(topic.to_owned()));
@@ -82,7 +84,7 @@ pub fn parse_topic(topic: &str) -> Result<(String, TopicKind), TopicError> {
         return Err(TopicError::InvalidPrinterId((*id).to_owned()));
     }
     let kind = TopicKind::parse(kind).ok_or_else(|| TopicError::UnknownKind((*kind).to_owned()))?;
-    Ok(((*id).to_owned(), kind))
+    Ok((PrinterId::from(*id), kind))
 }
 
 #[cfg(test)]
@@ -91,13 +93,16 @@ mod tests {
 
     #[test]
     fn builders_produce_contract_topics() {
-        assert_eq!(jobs_topic("stand-001"), "fotoko/printers/stand-001/jobs");
         assert_eq!(
-            status_topic("stand-001"),
+            jobs_topic(&"stand-001".into()),
+            "fotoko/printers/stand-001/jobs"
+        );
+        assert_eq!(
+            status_topic(&"stand-001".into()),
             "fotoko/printers/stand-001/status"
         );
         assert_eq!(
-            heartbeat_topic("stand-001"),
+            heartbeat_topic(&"stand-001".into()),
             "fotoko/printers/stand-001/heartbeat"
         );
     }
@@ -112,8 +117,8 @@ mod tests {
     #[test]
     fn parse_round_trips_every_kind() {
         for kind in [TopicKind::Jobs, TopicKind::Status, TopicKind::Heartbeat] {
-            let parsed = parse_topic(&topic("p-1", kind));
-            assert_eq!(parsed, Ok(("p-1".to_owned(), kind)));
+            let parsed = parse_topic(&topic(&"p-1".into(), kind));
+            assert_eq!(parsed, Ok(("p-1".into(), kind)));
         }
     }
 

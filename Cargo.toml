@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Async runtime
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 # Time and ids
-chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
 # Workspace crates
 fotoko-protocol = { path = "crates/protocol" }
