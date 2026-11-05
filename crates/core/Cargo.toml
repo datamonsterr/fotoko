@@ -1,0 +1,27 @@
+[package]
+name = "fotoko-core"
+description = "Fotoko domain: orders, state machine, pricing, payOS signing, ports and use cases. No IO."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# In-memory adapters for tests, the local server and the simulation e2e.
+testing = []
+
+[dependencies]
+async-trait = "=0.1.92"
+chrono.workspace = true
+fotoko-protocol.workspace = true
+hmac = "=0.13.0"
+serde_json.workspace = true
+sha2 = "=0.11.1"
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

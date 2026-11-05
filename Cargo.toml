@@ -25,6 +25,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["std", "ser
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
 # Workspace crates
 fotoko-protocol = { path = "crates/protocol" }
+fotoko-core = { path = "crates/core" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
