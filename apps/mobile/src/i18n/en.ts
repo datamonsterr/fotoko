@@ -38,6 +38,7 @@ export const en: Record<MessageKey, string> = {
   'picker.tooBig': 'A photo is too large (15 MB max) and was skipped.',
   'picker.unsupported':
     'Only JPEG or PNG photos are supported; others were skipped.',
+  'picker.failed': 'Could not open the photo library. Please try again.',
   'picker.remove': 'Remove photo {n}',
   'picker.photo': 'Photo {n}',
   'picker.copies': 'Copies: {copies}',
@@ -93,6 +94,11 @@ export const en: Record<MessageKey, string> = {
     'The payment provider has a problem, please try again later.',
   'error.internal': 'Something went wrong on our side, please try again later.',
   'error.invalid_response': 'The server sent an invalid response.',
+  'error.auth': 'Your session could not be verified. Please try again.',
+  'error.expired': 'The order or upload link has expired.',
+  'upload.expired':
+    'The order expired before the upload finished. Start over; your photos are kept.',
+  'upload.restart': 'Start over',
   'error.upload_failed': 'The photo upload failed.',
   'error.unknown': 'Something went wrong. Please try again.',
   'common.retry': 'Retry',

@@ -1,9 +1,9 @@
-import { ApiError, setApiClient, type ApiClient } from '@/api';
+import { ApiError, serverClock, setApiClient, type ApiClient } from '@/api';
 import type { UploadArgs } from '@/api/upload';
 import type { DraftPhoto } from '@/lib/photos';
 import { createdOrder, farFuture } from '@/test/fixtures';
 
-import { CheckoutFlow } from './checkoutFlow';
+import { CheckoutFlow, EXPIRY_MARGIN_MS } from './checkoutFlow';
 
 const draft = (n: number): DraftPhoto[] =>
   Array.from({ length: n }, (_, i) => ({
@@ -333,5 +333,248 @@ describe('CheckoutFlow failures and retry', () => {
       error: { code: 'invalid_response' },
     });
     expect(checkout).not.toHaveBeenCalled();
+  });
+});
+
+describe('CheckoutFlow lifecycle', () => {
+  it('unmount mid-upload aborts the upload and never checks out or calls onCheckout', async () => {
+    let signal: AbortSignal | undefined;
+    let fail: (e: unknown) => void = () => {};
+    const { flow, checkout, onCheckout, settle } = setup(1, {
+      upload: (a) => {
+        signal = a.signal;
+        return new Promise<void>((_, rej) => (fail = rej));
+      },
+    });
+    flow.start();
+    await settle();
+    expect(signal?.aborted).toBe(false);
+    const before = flow.getState();
+    flow.dispose();
+    expect(signal?.aborted).toBe(true);
+    fail(new ApiError('aborted', 'upload aborted'));
+    await settle();
+    expect(checkout).not.toHaveBeenCalled();
+    expect(onCheckout).not.toHaveBeenCalled();
+    expect(flow.getState()).toBe(before);
+  });
+
+  it('a successful upload finishing after dispose does not check out', async () => {
+    let finish: () => void = () => {};
+    const { flow, checkout, onCheckout, settle } = setup(1, {
+      upload: () => new Promise<void>((r) => (finish = r)),
+    });
+    flow.start();
+    await settle();
+    flow.dispose();
+    finish();
+    await settle();
+    expect(checkout).not.toHaveBeenCalled();
+    expect(onCheckout).not.toHaveBeenCalled();
+  });
+
+  it('dispose while checkout is in flight: onCheckout is not called', async () => {
+    let release: (v: typeof checkoutRes) => void = () => {};
+    const checkout = jest.fn(
+      () => new Promise<typeof checkoutRes>((r) => (release = r)),
+    );
+    const { flow, onCheckout, settle } = setup(1, { checkout });
+    flow.start();
+    await settle();
+    flow.dispose();
+    release(checkoutRes);
+    await settle();
+    expect(onCheckout).not.toHaveBeenCalled();
+    expect(flow.getState().phase).toBe('checkingOut');
+  });
+
+  it('start after dispose is ignored until arm()', async () => {
+    const { flow, createOrder, settle } = setup(1);
+    flow.dispose();
+    flow.start();
+    await settle();
+    expect(createOrder).not.toHaveBeenCalled();
+    flow.arm();
+    flow.start();
+    await settle();
+    expect(createOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('StrictMode: dispose + arm + start reuses the in-flight order and finishes once', async () => {
+    let created: (v: ReturnType<typeof createdOrder>) => void = () => {};
+    const createOrder = jest.fn(
+      () => new Promise<ReturnType<typeof createdOrder>>((r) => (created = r)),
+    );
+    const { flow, upload, checkout, onCheckout, settle } = setup(1, {
+      createOrder,
+    });
+    flow.start();
+    flow.dispose();
+    flow.arm();
+    flow.start();
+    await settle();
+    created(createdOrder(1));
+    await settle();
+    expect(createOrder).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(checkout).toHaveBeenCalledTimes(1);
+    expect(onCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  it('arm is a no-op when not disposed', async () => {
+    const { flow, createOrder, settle } = setup(1);
+    flow.arm();
+    flow.start();
+    await settle();
+    expect(createOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('setDeps swaps the callbacks used later', async () => {
+    const { flow, settle } = setup(1);
+    const other = jest.fn();
+    flow.setDeps({
+      client: () =>
+        ({
+          createOrder: jest.fn().mockResolvedValue(createdOrder(1)),
+          checkout: jest.fn().mockResolvedValue(checkoutRes),
+        }) as unknown as ApiClient,
+      upload: async () => {},
+      onCheckout: other,
+    });
+    flow.start();
+    await settle();
+    expect(other).toHaveBeenCalled();
+  });
+});
+
+describe('CheckoutFlow expiry and restart', () => {
+  afterEach(() => serverClock.reset());
+
+  it('an expired upload URL puts the flow in the expired phase (not error)', async () => {
+    const createOrder = jest.fn().mockResolvedValue({
+      ...createdOrder(1),
+      uploads: [
+        { ...createdOrder(1).uploads[0], expiresAt: '2000-01-01T00:00:00Z' },
+      ],
+    });
+    const { flow, checkout, settle } = setup(1, { createOrder });
+    flow.start();
+    await settle();
+    expect(flow.getState().phase).toBe('expired');
+    expect(flow.getState().photos[0]?.error).toMatchObject({ code: 'expired' });
+    expect(checkout).not.toHaveBeenCalled();
+  });
+
+  it('applies a safety margin', async () => {
+    const t = Date.parse('2030-01-01T00:00:00Z');
+    const createOrder = jest.fn().mockResolvedValue({
+      ...createdOrder(1),
+      uploads: [
+        {
+          ...createdOrder(1).uploads[0],
+          expiresAt: new Date(t + EXPIRY_MARGIN_MS - 1).toISOString(),
+        },
+      ],
+      expiresAt: new Date(t + 900_000).toISOString(),
+    });
+    const { flow, upload, settle } = setup(1, { createOrder, now: () => t });
+    flow.start();
+    await settle();
+    expect(upload).not.toHaveBeenCalled();
+    expect(flow.getState().phase).toBe('expired');
+  });
+
+  it('the order expiring before checkout is expired too', async () => {
+    let t = Date.parse('2030-01-01T00:00:00Z');
+    const createOrder = jest.fn().mockResolvedValue({
+      ...createdOrder(1),
+      expiresAt: new Date(t + 60_000).toISOString(),
+      uploads: [
+        {
+          ...createdOrder(1).uploads[0],
+          expiresAt: new Date(t + 900_000).toISOString(),
+        },
+      ],
+    });
+    const { flow, checkout, settle } = setup(1, {
+      createOrder,
+      upload: async () => {
+        t += 45_000;
+      },
+      now: () => t,
+    });
+    flow.start();
+    await settle();
+    expect(flow.getState().phase).toBe('expired');
+    expect(checkout).not.toHaveBeenCalled();
+  });
+
+  it('uses the server clock offset by default', async () => {
+    // Device clock is 1 h behind the server: a URL valid for 30 min of device time is expired.
+    serverClock.observe(new Date(Date.now() + 3_600_000).toUTCString());
+    const createOrder = jest.fn().mockResolvedValue({
+      ...createdOrder(1),
+      expiresAt: new Date(Date.now() + 1_800_000).toISOString(),
+      uploads: [
+        {
+          ...createdOrder(1).uploads[0],
+          expiresAt: new Date(Date.now() + 1_800_000).toISOString(),
+        },
+      ],
+    });
+    const { flow, upload, settle } = setup(1, { createOrder });
+    flow.start();
+    await settle();
+    expect(upload).not.toHaveBeenCalled();
+    expect(flow.getState().phase).toBe('expired');
+  });
+
+  it('restart cancels the old order best-effort and creates a new one with the same photos', async () => {
+    const createOrder = jest
+      .fn()
+      .mockResolvedValueOnce({
+        ...createdOrder(1),
+        uploads: [
+          { ...createdOrder(1).uploads[0], expiresAt: '2000-01-01T00:00:00Z' },
+        ],
+      })
+      .mockResolvedValueOnce({ ...createdOrder(1), orderId: 'ord-2' });
+    const cancelOrder = jest
+      .fn()
+      .mockRejectedValue(new ApiError('conflict', 'x'));
+    const checkout = jest
+      .fn()
+      .mockResolvedValue({ ...checkoutRes, orderId: 'ord-2' });
+    const upload = jest.fn(async () => {});
+    const onCheckout = jest.fn();
+    const flow = new CheckoutFlow('stand-001', draft(1), {
+      client: () =>
+        ({ createOrder, cancelOrder, checkout }) as unknown as ApiClient,
+      upload,
+      onCheckout,
+    });
+    flow.start();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(flow.getState().phase).toBe('expired');
+    flow.restart();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cancelOrder).toHaveBeenCalledWith('ord-1');
+    expect(createOrder).toHaveBeenCalledTimes(2);
+    expect(createOrder.mock.calls[1]).toEqual(createOrder.mock.calls[0]);
+    expect(onCheckout).toHaveBeenCalledWith('https://pay.example/c', 'ord-2');
+    expect(flow.getState().orderId).toBe('ord-2');
+  });
+
+  it('restart without an old order just starts', async () => {
+    const createOrder = jest
+      .fn()
+      .mockRejectedValueOnce(new ApiError('network', 'x'))
+      .mockResolvedValueOnce(createdOrder(1));
+    const { flow, settle } = setup(1, { createOrder });
+    flow.start();
+    await settle();
+    flow.restart();
+    await settle();
+    expect(flow.getState().phase).toBe('redirected');
   });
 });

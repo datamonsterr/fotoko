@@ -1,3 +1,5 @@
+import { serverClock } from '@/api/clock';
+
 import { createAwsAuth, parseUrl, REFRESH_SKEW_MS } from './aws';
 import type { AwsCredentials } from './cognito';
 
@@ -138,5 +140,39 @@ describe('parseUrl', () => {
 
   it('rejects relative URLs', () => {
     expect(() => parseUrl('/v1/orders')).toThrow(/absolute/);
+  });
+});
+
+describe('aws auth: invalidate and clock', () => {
+  it('invalidate drops the cache so the next call fetches fresh credentials', async () => {
+    const get = jest
+      .fn<Promise<AwsCredentials>, []>()
+      .mockResolvedValueOnce(creds(NOW + 3_600_000, 'OLD'))
+      .mockResolvedValueOnce(creds(NOW + 3_600_000, 'NEW'));
+    const auth = make(get);
+    const r = { method: 'GET', url: 'https://h.example/x' };
+    expect((await auth.headers(r)).authorization).toContain('Credential=OLD/');
+    auth.invalidate?.();
+    expect((await auth.headers(r)).authorization).toContain('Credential=NEW/');
+  });
+
+  it('signs with the server-corrected clock by default', async () => {
+    serverClock.observe(new Date(Date.UTC(2031, 5, 7, 8, 9, 10)).toUTCString());
+    const auth = createAwsAuth({
+      region: 'r',
+      getCredentials: async () => creds(Date.UTC(2031, 5, 7, 12)),
+    });
+    const h = await auth.headers({ method: 'GET', url: 'https://h.example/x' });
+    expect(h['x-amz-date']).toMatch(/^20310607T0809\d\dZ$/);
+    serverClock.reset();
+  });
+
+  it('omits the session token header when the credentials have none', async () => {
+    const auth = make(async () => ({
+      ...creds(NOW + 3_600_000),
+      sessionToken: '',
+    }));
+    const h = await auth.headers({ method: 'GET', url: 'https://h.example/x' });
+    expect(h).not.toHaveProperty('x-amz-security-token');
   });
 });

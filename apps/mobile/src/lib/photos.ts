@@ -43,7 +43,7 @@ export async function toDraftPhotos(
   opts: {
     existingCount: number;
     newId: () => string;
-    /** Used when the picker reports no file size. */
+    /** Real size of the bytes that will be PUT; the picker's `fileSize` can differ (re-encoding). */
     readSize: (uri: string) => Promise<number>;
   },
 ): Promise<ConvertResult> {
@@ -63,7 +63,7 @@ export async function toDraftPhotos(
       result.unsupported++;
       continue;
     }
-    const sizeBytes = asset.fileSize ?? (await opts.readSize(asset.uri));
+    const sizeBytes = await opts.readSize(asset.uri);
     if (sizeBytes > MAX_PHOTO_BYTES) {
       result.tooBig++;
       continue;

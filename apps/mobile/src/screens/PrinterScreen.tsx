@@ -1,7 +1,7 @@
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
 
-import { ApiError, type ApiClient } from '@/api';
+import { ApiError } from '@/api';
 import { Button } from '@/components/Button';
 import { ErrorBox } from '@/components/ErrorBox';
 import { Screen } from '@/components/Screen';
@@ -10,16 +10,10 @@ import { usePrinter } from '@/hooks/usePrinter';
 import { useI18n } from '@/i18n';
 import { formatVnd } from '@/lib/price';
 
-export function PrinterScreen({
-  printerId,
-  client,
-}: {
-  printerId: string;
-  client?: () => ApiClient;
-}) {
+export function PrinterScreen({ printerId }: { printerId: string }) {
   const { t } = useI18n();
   const router = useRouter();
-  const { state, reload } = usePrinter(printerId, client);
+  const { state, reload } = usePrinter(printerId);
 
   if (state.phase === 'loading') {
     return (

@@ -2,9 +2,11 @@ import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { ApiError, type ApiClient, type Printer } from '@/api';
 import { printer } from '@/test/fixtures';
-import { renderApp, router } from '@/test/render';
+import { renderApp, router, withApi } from '@/test/render';
 
-import { PrinterScreen } from './PrinterScreen';
+import { PrinterScreen as RealPrinterScreen } from './PrinterScreen';
+
+const PrinterScreen = withApi(RealPrinterScreen);
 
 beforeEach(() => jest.clearAllMocks());
 

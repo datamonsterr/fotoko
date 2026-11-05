@@ -17,5 +17,20 @@ const compatibleExpoConfig = expoConfig.map((config) =>
 
 module.exports = defineConfig([
   compatibleExpoConfig,
-  { ignores: ['dist/*', 'coverage/*', '.expo/*'] },
+  { ignores: ['dist/*', 'coverage/*', '.expo/*', '.maestro/*'] },
+  {
+    files: ['*.js'],
+    languageOptions: { globals: { __dirname: 'readonly' } },
+  },
+  {
+    // Type-aware rules: a forgotten `await` on a payment or upload call must not pass lint.
+    files: ['**/*.{ts,tsx}'],
+    languageOptions: {
+      parserOptions: { projectService: true, tsconfigRootDir: __dirname },
+    },
+    rules: {
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+    },
+  },
 ]);

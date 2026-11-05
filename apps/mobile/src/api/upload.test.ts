@@ -1,4 +1,4 @@
-import { putPhoto } from './upload';
+import { putPhoto, UPLOAD_TIMEOUT_MS } from './upload';
 
 class FakeXhr {
   status = 200;
@@ -7,8 +7,16 @@ class FakeXhr {
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   ontimeout: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  timeout = 0;
+  aborted = false;
+  abort() {
+    this.aborted = true;
+    this.onabort?.();
+  }
   opened: [string, string] | null = null;
   sent: unknown;
+  hang = false;
   outcome: 'load' | 'error' | 'timeout' = 'load';
   progress: { loaded: number; total: number; lengthComputable: boolean }[] = [];
   open(m: string, u: string) {
@@ -19,6 +27,7 @@ class FakeXhr {
   }
   send(body: unknown) {
     this.sent = body;
+    if (this.hang) return;
     this.progress.forEach((p) => this.upload.onprogress?.(p));
     if (this.outcome === 'load') this.onload?.();
     else if (this.outcome === 'error') this.onerror?.();
@@ -123,5 +132,41 @@ describe('putPhoto', () => {
     expect(xhr.sent).toBe(blob);
     globalThis.XMLHttpRequest = Original;
     fetchSpy.mockRestore();
+  });
+
+  it('sets a 90 s timeout', async () => {
+    const xhr = new FakeXhr();
+    await run(xhr);
+    expect(xhr.timeout).toBe(90_000);
+    expect(UPLOAD_TIMEOUT_MS).toBe(90_000);
+  });
+
+  it('aborts the XHR when the signal fires and rejects aborted', async () => {
+    const xhr = new FakeXhr();
+    xhr.hang = true;
+    const ctrl = new AbortController();
+    const p = run(xhr, { signal: ctrl.signal });
+    await new Promise((r) => setTimeout(r, 0));
+    ctrl.abort();
+    await expect(p).rejects.toMatchObject({ code: 'aborted' });
+    expect(xhr.aborted).toBe(true);
+  });
+
+  it('rejects aborted without touching the network when already aborted', async () => {
+    const xhr = new FakeXhr();
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await expect(run(xhr, { signal: ctrl.signal })).rejects.toMatchObject({
+      code: 'aborted',
+    });
+    expect(xhr.opened).toBeNull();
+  });
+
+  it('stops listening to the signal once finished', async () => {
+    const xhr = new FakeXhr();
+    const ctrl = new AbortController();
+    await run(xhr, { signal: ctrl.signal });
+    ctrl.abort();
+    expect(xhr.aborted).toBe(false);
   });
 });

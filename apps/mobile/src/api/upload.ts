@@ -7,7 +7,12 @@ export interface UploadArgs {
   uri: string;
   contentType: string;
   onProgress?: (fraction: number) => void;
+  /** Aborts the PUT; the promise then rejects with ApiError('aborted'). */
+  signal?: AbortSignal;
 }
+
+/** A photo is at most 15 MiB; this is generous for a slow cellular link, but not forever. */
+export const UPLOAD_TIMEOUT_MS = 90_000;
 
 export interface UploadDeps {
   /** Reads the photo into a body for XHR. Defaults to `fetch(uri).blob()`. */
@@ -18,7 +23,8 @@ export interface UploadDeps {
 /**
  * PUT a photo to its presigned S3 URL. Presigned: no auth headers. XHR (not fetch) because only
  * XHR reports upload progress on React Native and web. Rejects with ApiError('network') on
- * transport failure and ApiError('upload_failed') on a non-2xx status.
+ * transport failure or timeout, ApiError('aborted') on abort, and ApiError('upload_failed') on a
+ * non-2xx status.
  */
 export async function putPhoto(
   args: UploadArgs,
@@ -26,6 +32,7 @@ export async function putPhoto(
 ): Promise<void> {
   const readBody =
     deps.readBody ?? (async (uri: string) => (await fetch(uri)).blob());
+  if (args.signal?.aborted) throw new ApiError('aborted', 'upload aborted');
   const body = await readBody(args.uri).catch((e: unknown) => {
     throw new ApiError(
       'network',
@@ -34,7 +41,15 @@ export async function putPhoto(
   });
   const xhr = deps.createXhr ? deps.createXhr() : new XMLHttpRequest();
   await new Promise<void>((resolve, reject) => {
+    const onAbort = () => xhr.abort();
+    // Stop listening once settled so a long-lived signal does not hold the XHR.
+    const finish = (err?: ApiError) => {
+      args.signal?.removeEventListener('abort', onAbort);
+      if (err) reject(err);
+      else resolve();
+    };
     xhr.open('PUT', args.url);
+    xhr.timeout = UPLOAD_TIMEOUT_MS;
     const headers = { ...args.headers };
     if (!Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) {
       headers['content-type'] = args.contentType;
@@ -47,9 +62,9 @@ export async function putPhoto(
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         args.onProgress?.(1);
-        resolve();
+        finish();
       } else {
-        reject(
+        finish(
           new ApiError(
             'upload_failed',
             `upload failed (${xhr.status})`,
@@ -58,8 +73,10 @@ export async function putPhoto(
         );
       }
     };
-    xhr.onerror = () => reject(new ApiError('network', 'upload failed'));
-    xhr.ontimeout = () => reject(new ApiError('network', 'upload timed out'));
+    xhr.onerror = () => finish(new ApiError('network', 'upload failed'));
+    xhr.onabort = () => finish(new ApiError('aborted', 'upload aborted'));
+    xhr.ontimeout = () => finish(new ApiError('network', 'upload timed out'));
+    args.signal?.addEventListener('abort', onAbort);
     xhr.send(body);
   });
 }
