@@ -46,6 +46,9 @@ pub struct CupsSettings {
     pub poll_interval: Duration,
     /// Kill any single CUPS command that runs longer than this.
     pub command_timeout: Duration,
+    /// The user `lp` submits as (the `lpstat -o` owner column). Only that user's jobs are ever
+    /// swept after a hung `lp`; without it no sweep happens.
+    pub owner: Option<String>,
 }
 
 impl From<&PrinterConfig> for CupsSettings {
@@ -59,6 +62,10 @@ impl From<&PrinterConfig> for CupsSettings {
             print_timeout: Duration::from_secs(config.print_timeout_secs),
             poll_interval: Duration::from_millis(config.poll_interval_ms),
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            owner: std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .ok()
+                .filter(|u| !u.is_empty()),
         }
     }
 }
@@ -83,6 +90,17 @@ pub enum JobEnd {
     Aborted,
     /// Cancelled by someone.
     Canceled,
+}
+
+/// Consecutive failed `lpstat` polls tolerated before the print fails.
+const MAX_TRANSIENT_FAILURES: u32 = 3;
+
+/// Why one poll could not tell whether the job is done.
+enum Poll {
+    /// `lpstat` itself failed; worth another try.
+    Transient(PrintError),
+    /// The printer or the job is in a failed state.
+    Fatal(PrintError),
 }
 
 struct Output {
@@ -199,9 +217,18 @@ impl CupsPrinter {
         Ok(classify_printer_status(&text))
     }
 
-    async fn queued_jobs(&self) -> Result<Vec<String>, PrintError> {
+    async fn queued_entries(&self) -> Result<Vec<(String, Option<String>)>, PrintError> {
         let text = self.lpstat(&["-o", &self.settings.queue]).await?;
-        Ok(listed_jobs(&text))
+        Ok(listed_entries(&text))
+    }
+
+    async fn queued_jobs(&self) -> Result<Vec<String>, PrintError> {
+        Ok(self
+            .queued_entries()
+            .await?
+            .into_iter()
+            .map(|(job, _)| job)
+            .collect())
     }
 
     async fn cancel(&self, job: &str) {
@@ -212,29 +239,44 @@ impl CupsPrinter {
         }
     }
 
-    /// `lp` hung and was killed: it may still have queued the job. Cancel whatever appeared.
-    async fn cancel_new_jobs(&self, before: &HashSet<String>) {
-        match self.queued_jobs().await {
+    /// `lp` hung and was killed: it may still have queued the job. Cancel the jobs that appeared
+    /// since `before` and belong to our user. Without a good snapshot or a known owner nothing is
+    /// cancelled, because other users' (or earlier) jobs must never be touched.
+    async fn cancel_new_jobs(&self, before: Option<&HashSet<String>>) {
+        let (Some(before), Some(owner)) = (before, self.settings.owner.as_deref()) else {
+            warn!("lp hung and the queue before it is unknown, not sweeping the queue");
+            return;
+        };
+        match self.queued_entries().await {
             Ok(now) => {
-                for job in now.iter().filter(|j| !before.contains(*j)) {
-                    warn!(job, "cancelling job queued by a hung lp");
-                    self.cancel(job).await;
+                for (job, job_owner) in &now {
+                    if !before.contains(job) && job_owner.as_deref() == Some(owner) {
+                        warn!(job, "cancelling job queued by a hung lp");
+                        self.cancel(job).await;
+                    }
                 }
             }
             Err(error) => warn!(%error, "cannot list queue after lp timeout"),
         }
     }
 
+    /// Whether the job already left the queue and CUPS says it printed.
+    async fn finished_ok(&self, job: &str) -> bool {
+        matches!(self.queued_jobs().await, Ok(jobs) if !jobs.iter().any(|j| j == job))
+            && self.confirm_finished(job).await.is_ok()
+    }
+
     /// One poll: `Ok(true)` when the job has finished, `Ok(false)` while it is still working.
-    async fn poll_once(&self, job: &str) -> Result<bool, PrintError> {
-        if !self.queued_jobs().await?.iter().any(|j| j == job) {
-            self.confirm_finished(job).await?;
+    async fn poll_once(&self, job: &str) -> Result<bool, Poll> {
+        let queued = self.queued_jobs().await.map_err(Poll::Transient)?;
+        if !queued.iter().any(|j| j == job) {
+            self.confirm_finished(job).await.map_err(Poll::Fatal)?;
             return Ok(true);
         }
-        if let Health::Stopped(error) = self.health().await? {
-            return Err(error);
+        match self.health().await.map_err(Poll::Transient)? {
+            Health::Stopped(error) => Err(Poll::Fatal(error)),
+            Health::Idle | Health::Printing => Ok(false),
         }
-        Ok(false)
     }
 
     /// The job left the queue: check CUPS says it printed. If the history cannot say (disabled,
@@ -272,12 +314,12 @@ impl Printer for CupsPrinter {
     ) -> Result<(), PrintError> {
         // Only 4x6 exists; the CUPS media name comes from the config.
         let Media::Photo4x6 = media;
-        let before: HashSet<String> = self
+        // The queue before lp, to tell its job apart if lp hangs; `None` if it cannot be read.
+        let before: Option<HashSet<String>> = self
             .queued_jobs()
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+            .ok()
+            .map(|jobs| jobs.into_iter().collect());
         let copies = copies.to_string();
         let media_option = format!("media={}", self.settings.media);
         let file = file.to_string_lossy();
@@ -303,7 +345,7 @@ impl Printer for CupsPrinter {
             Ok(out) => out,
             Err(error) => {
                 if matches!(error, RunError::TimedOut(_)) {
-                    self.cancel_new_jobs(&before).await;
+                    self.cancel_new_jobs(before.as_ref()).await;
                 }
                 return Err(error.into_print_error());
             }
@@ -322,13 +364,18 @@ impl Printer for CupsPrinter {
         };
 
         let deadline = Instant::now() + self.settings.print_timeout;
+        let mut failures = 0;
         loop {
             let step = tokio::select! {
                 biased;
                 () = ctx.cancel.cancelled() => {
-                    self.cancel(&job).await;
+                    // One last look: a job that already printed must not be reported failed.
+                    let printed = self.finished_ok(&job).await;
+                    if !printed {
+                        self.cancel(&job).await;
+                    }
                     guard.disarm();
-                    return Err(PrintError::Cancelled);
+                    return if printed { Ok(()) } else { Err(PrintError::Cancelled) };
                 }
                 step = self.poll_once(&job) => step,
             };
@@ -337,8 +384,17 @@ impl Printer for CupsPrinter {
                     guard.disarm();
                     return Ok(());
                 }
-                Ok(false) => {}
-                Err(error) => {
+                Ok(false) => failures = 0,
+                Err(Poll::Transient(error)) => {
+                    failures += 1;
+                    warn!(%job, failures, %error, "lpstat failed while waiting for the job");
+                    if failures > MAX_TRANSIENT_FAILURES {
+                        self.cancel(&job).await;
+                        guard.disarm();
+                        return Err(error);
+                    }
+                }
+                Err(Poll::Fatal(error)) => {
                     self.cancel(&job).await;
                     guard.disarm();
                     return Err(error);
@@ -385,6 +441,19 @@ pub fn listed_jobs(stdout: &str) -> Vec<String> {
         .filter(|line| !line.starts_with(char::is_whitespace))
         .filter_map(|line| line.split_whitespace().next())
         .map(str::to_owned)
+        .collect()
+}
+
+/// Job ids and owners from `lpstat -o` (`id owner size date`); the owner is the second column.
+pub fn listed_entries(stdout: &str) -> Vec<(String, Option<String>)> {
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let job = cols.next()?.to_owned();
+            Some((job, cols.next().map(str::to_owned)))
+        })
         .collect()
 }
 
@@ -573,6 +642,18 @@ mod tests {
     }
 
     #[test]
+    fn entries_carry_the_owner_column() {
+        let listing = "q-1  alice  10  Thu\n\tAlerts: x\nq-2\n";
+        assert_eq!(
+            listed_entries(listing),
+            [
+                ("q-1".to_owned(), Some("alice".to_owned())),
+                ("q-2".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
     fn classify_idle_and_printing() {
         assert_eq!(
             classify_printer_status("printer fotoko is idle.  enabled since Thu 05 Nov 2026"),
@@ -721,6 +802,7 @@ mod tests {
             print_timeout: Duration::from_millis(600),
             poll_interval: Duration::from_millis(20),
             command_timeout: Duration::from_secs(10),
+            owner: Some("root".into()),
         };
         Stubs { dir, settings }
     }
@@ -961,6 +1043,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hung_lp_sweep_needs_a_snapshot_and_only_touches_our_jobs() {
+        // Snapshot fails: no sweep.
+        let failing_snapshot = "n=$(cat \"$0.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.n\"; if [ $n -eq 1 ]; then echo 'lpstat: down' >&2; exit 1; fi; echo 'q-9 root 1 now'";
+        let mut s = stubs(
+            "sleep 5",
+            &lpstat(DONE, failing_snapshot, IDLE),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        s.settings.command_timeout = Duration::from_millis(200);
+        assert!(s.print().await.is_err());
+        assert_eq!(s.log("cancel"), "", "no sweep without a snapshot");
+        // Owner unknown: no sweep.
+        let queued = "echo 'q-9 root 1 now'";
+        let mut s = stubs(
+            "sleep 5",
+            &lpstat(DONE, queued, IDLE),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        s.settings.command_timeout = Duration::from_millis(200);
+        s.settings.owner = None;
+        assert!(s.print().await.is_err());
+        assert_eq!(s.log("cancel"), "");
+        // New job of another user: left alone; new job of ours: cancelled.
+        let after = "if [ -e \"$(dirname \"$0\")/queued\" ]; then echo 'q-8 alice 1 now'; echo 'q-9 root 1 now'; fi";
+        let mut s = stubs(
+            "touch \"$(dirname \"$0\")/queued\"; sleep 5",
+            &lpstat(DONE, after, IDLE),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        s.settings.command_timeout = Duration::from_millis(300);
+        assert!(s.print().await.is_err());
+        assert_eq!(s.log("cancel").trim(), "q-9");
+    }
+
+    #[tokio::test]
+    async fn a_few_lpstat_failures_in_a_row_are_tolerated() {
+        // Calls: 1 snapshot ok, 2 to 4 fail, then the job is gone.
+        let queue = "n=$(cat \"$0.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.n\"; if [ $n -ge 2 ] && [ $n -le 4 ]; then echo 'lpstat: busy' >&2; exit 1; fi; if [ $n -eq 1 ]; then exit 0; fi";
+        let s = stubs(LP_OK, &lpstat(DONE, queue, IDLE), "exit 0");
+        s.print().await.unwrap();
+        // Four in a row is too many.
+        let queue = "n=$(cat \"$0.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.n\"; if [ $n -ge 2 ] && [ $n -le 5 ]; then echo 'lpstat: busy' >&2; exit 1; fi";
+        let s = stubs(
+            LP_OK,
+            &lpstat(DONE, queue, IDLE),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        assert!(matches!(s.print().await, Err(PrintError::Driver(_))));
+        assert_eq!(s.log("cancel").trim(), "q-7");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_job_that_already_finished_is_not_a_failure() {
+        let s = stubs(
+            LP_OK,
+            &lpstat(DONE, "exit 0", IDLE),
+            "echo \"$@\" >> \"$0.log\"",
+        );
+        let ctx = PrintContext::new("job-1");
+        ctx.cancel.cancel();
+        s.printer()
+            .print(&s.file(), 1, Media::Photo4x6, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(s.log("cancel"), "", "nothing to cancel");
+    }
+
+    #[tokio::test]
     async fn state_maps_health() {
         let cases = [
             (
@@ -1014,5 +1164,12 @@ mod tests {
         assert_eq!(s.poll_interval, Duration::from_millis(250));
         assert_eq!(s.queue, "fotoko");
         assert_eq!(s.command_timeout, Duration::from_secs(30));
+        assert_eq!(
+            s.owner,
+            std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .ok()
+                .filter(|u| !u.is_empty())
+        );
     }
 }

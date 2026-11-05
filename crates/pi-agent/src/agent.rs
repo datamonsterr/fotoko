@@ -16,7 +16,7 @@ use std::time::Duration;
 use fotoko_protocol::{MAX_PHOTO_BYTES, PrinterId, PrinterState, jobs_topic};
 use rumqttc::{AsyncClient, Event, Incoming, Outgoing, QoS};
 use thiserror::Error;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -26,7 +26,7 @@ use crate::cups::{CupsPrinter, CupsSettings};
 use crate::dedupe::{DedupeStore, StoreError};
 use crate::download::UrlPolicy;
 use crate::download::{DownloadError, Downloader};
-use crate::handler::{JobHandler, reject};
+use crate::handler::{JobHandler, STATUS_TIMEOUT, reject};
 use crate::mqtt::{MqttError, MqttSink, Sink, heartbeat, mqtt_options};
 use crate::printer::{PrintError, Printer};
 use crate::sim_backend::SimBackend;
@@ -65,6 +65,8 @@ const DISCONNECT_WAIT: Duration = Duration::from_secs(5);
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
 /// Jobs waiting for the worker; more are rejected with `failed`.
 pub const JOB_QUEUE: usize = 32;
+/// Rejections being published at once; beyond this a rejected job gets no status at all.
+pub const MAX_REJECTS_IN_FLIGHT: usize = 8;
 
 /// Build the printer a config asks for.
 pub fn build_printer(config: &Config) -> Result<Arc<dyn Printer>, PrintError> {
@@ -157,6 +159,7 @@ impl Agent {
             link_up: Arc::clone(&link_up),
             sink: Arc::clone(&sink),
             printer_id: config.printer_id.clone(),
+            reject_slots: Arc::new(Semaphore::new(MAX_REJECTS_IN_FLIGHT)),
             stop: net_stop.clone(),
         }));
         let mut worker = tokio::spawn(worker_loop(handler, jobs_rx, stop.clone()));
@@ -255,7 +258,34 @@ struct Network {
     link_up: Arc<AtomicBool>,
     sink: Arc<dyn Sink>,
     printer_id: PrinterId,
+    reject_slots: Arc<Semaphore>,
     stop: CancellationToken,
+}
+
+/// Publish a `queue full` failure in the background, at most [`MAX_REJECTS_IN_FLIGHT`] at a time
+/// and each for at most [`STATUS_TIMEOUT`]. Returns `false` (dropping the status) at the cap.
+fn spawn_reject(
+    slots: &Arc<Semaphore>,
+    sink: Arc<dyn Sink>,
+    printer_id: PrinterId,
+    payload: Vec<u8>,
+) -> bool {
+    let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+        warn!("too many rejections in flight, dropping a status");
+        return false;
+    };
+    tokio::spawn(async move {
+        reject(
+            sink.as_ref(),
+            &printer_id,
+            &payload,
+            "queue full",
+            STATUS_TIMEOUT,
+        )
+        .await;
+        drop(permit);
+    });
+    true
 }
 
 async fn network_loop(mut net: Network) {
@@ -288,10 +318,12 @@ async fn network_loop(mut net: Network) {
                         warn!("job queue full, rejecting job");
                         // Publishing may wait for this very loop to drain the request queue, so
                         // it happens in its own task.
-                        let (sink, id) = (Arc::clone(&net.sink), net.printer_id.clone());
-                        tokio::spawn(async move {
-                            reject(sink.as_ref(), &id, &payload, "queue full").await;
-                        });
+                        spawn_reject(
+                            &net.reject_slots,
+                            Arc::clone(&net.sink),
+                            net.printer_id.clone(),
+                            payload,
+                        );
                     }
                     // The worker only goes away during shutdown.
                     Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -429,6 +461,43 @@ mod tests {
             self.0.lock().unwrap().push(beat.clone());
             Ok(())
         }
+    }
+
+    struct StuckSink;
+
+    #[async_trait::async_trait]
+    impl Sink for StuckSink {
+        async fn status(&self, _: &fotoko_protocol::JobStatus) -> Result<(), MqttError> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        fn heartbeat(&self, _: &fotoko_protocol::Heartbeat) -> Result<(), MqttError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rejections_in_flight_are_capped() {
+        let slots = Arc::new(Semaphore::new(MAX_REJECTS_IN_FLIGHT));
+        let sink: Arc<dyn Sink> = Arc::new(StuckSink);
+        let id = PrinterId::new("stand-001").unwrap();
+        let payload = br#"{"jobId":"j","orderId":"o","printerId":"stand-001","media":"4x6","createdAt":"2026-01-01T00:00:00Z","photos":[]}"#.to_vec();
+        for _ in 0..MAX_REJECTS_IN_FLIGHT {
+            assert!(spawn_reject(
+                &slots,
+                Arc::clone(&sink),
+                id.clone(),
+                payload.clone()
+            ));
+        }
+        assert!(!spawn_reject(
+            &slots,
+            Arc::clone(&sink),
+            id.clone(),
+            payload.clone()
+        ));
+        assert_eq!(slots.available_permits(), 0);
     }
 
     #[tokio::test]

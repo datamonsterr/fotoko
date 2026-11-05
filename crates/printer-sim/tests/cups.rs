@@ -50,6 +50,7 @@ fn fixture_with(paper: u32, latency_ms: u64) -> Fixture {
         print_timeout: Duration::from_secs(10),
         poll_interval: Duration::from_millis(30),
         command_timeout: Duration::from_secs(10),
+        owner: None,
     };
     let mut env = FakeCupsEnv::new(&state);
     env.paper = paper;
@@ -213,6 +214,7 @@ async fn unknown_queue_is_reported_as_offline() {
         print_timeout: Duration::from_secs(5),
         poll_interval: Duration::from_millis(20),
         command_timeout: Duration::from_secs(5),
+        owner: None,
     });
     let error = strict
         .print(&file, 1, Media::Photo4x6, &ctx())
