@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.local/share/otherskill/bin/otherskill\" 'find' '--agent' 'claude' '--config' \"$CLAUDE_PROJECT_DIR/otherskill.config.json\"",
+            "command": "L=\"$HOME/.local/share/otherskill/bin/otherskill\"; [ -x \"$L\" ] || exit 0; exec \"$L\" 'find' '--agent' 'claude' '--config' \"$CLAUDE_PROJECT_DIR/otherskill.config.json\"",
             "timeout": 46
           }
         ]

@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{OrderId, PhotoId, PrinterId};
+
 /// Photo media size a printer supports. Only 4x6 inch today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Media {
@@ -76,6 +78,9 @@ pub enum ErrorCode {
     PaymentProvider,
     /// Unexpected server error.
     Internal,
+    /// A code this client version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `{"error":{"code":"...","message":"..."}}` payload.
@@ -118,7 +123,7 @@ pub struct Health {
 #[serde(rename_all = "camelCase")]
 pub struct PrinterInfo {
     /// Printer (Thing) id.
-    pub printer_id: String,
+    pub printer_id: PrinterId,
     /// Display name.
     pub name: String,
     /// Availability.
@@ -146,7 +151,7 @@ pub struct PhotoSpec {
 #[serde(rename_all = "camelCase")]
 pub struct CreateOrderRequest {
     /// Target printer.
-    pub printer_id: String,
+    pub printer_id: PrinterId,
     /// Photos to print.
     pub photos: Vec<PhotoSpec>,
 }
@@ -164,7 +169,7 @@ pub enum UploadMethod {
 #[serde(rename_all = "camelCase")]
 pub struct UploadTarget {
     /// Photo id.
-    pub photo_id: String,
+    pub photo_id: PhotoId,
     /// Presigned URL.
     pub url: String,
     /// Method to use.
@@ -180,7 +185,7 @@ pub struct UploadTarget {
 #[serde(rename_all = "camelCase")]
 pub struct CreateOrderResponse {
     /// New order id.
-    pub order_id: String,
+    pub order_id: OrderId,
     /// Always `awaiting_upload`.
     pub status: OrderStatus,
     /// Total price in VND.
@@ -196,7 +201,7 @@ pub struct CreateOrderResponse {
 #[serde(rename_all = "camelCase")]
 pub struct OrderPhoto {
     /// Photo id.
-    pub photo_id: String,
+    pub photo_id: PhotoId,
     /// Copies to print.
     pub copies: u32,
     /// Image format.
@@ -219,9 +224,9 @@ pub struct OrderError {
 #[serde(rename_all = "camelCase")]
 pub struct Order {
     /// Order id.
-    pub order_id: String,
+    pub order_id: OrderId,
     /// Printer id.
-    pub printer_id: String,
+    pub printer_id: PrinterId,
     /// Status.
     pub status: OrderStatus,
     /// Total price in VND.
@@ -247,7 +252,7 @@ pub struct Order {
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutResponse {
     /// Order id.
-    pub order_id: String,
+    pub order_id: OrderId,
     /// Always `awaiting_payment`.
     pub status: OrderStatus,
     /// payOS order code.
@@ -363,6 +368,18 @@ mod tests {
         for (code, wire) in all {
             check(&code, json!(wire));
         }
+    }
+
+    #[test]
+    fn unknown_error_code_falls_back() {
+        assert_eq!(
+            serde_json::from_value::<ErrorCode>(json!("rate_limited")).expect("deserialize"),
+            ErrorCode::Unknown
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::Unknown).expect("serialize"),
+            json!("unknown")
+        );
     }
 
     #[test]

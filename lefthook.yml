@@ -1,4 +1,5 @@
 pre-commit:
+  skip: [merge, rebase]
   parallel: true
   commands:
     prettier:
@@ -8,10 +9,12 @@ pre-commit:
       glob: '*.rs'
       run: cargo fmt --all --check
 commit-msg:
+  skip: [merge, rebase]
   commands:
     commitlint:
       run: pnpm exec commitlint --edit "{1}"
 pre-push:
+  skip: [merge, rebase]
   commands:
     fast:
       run: bash scripts/ci/fast.sh

@@ -2,11 +2,13 @@
 //! limits. Pure data and pure functions, no IO. Source of truth: `docs/contracts.md`.
 
 pub mod http;
+pub mod ids;
 pub mod limits;
 pub mod mqtt;
 pub mod topics;
 
 pub use http::*;
+pub use ids::*;
 pub use limits::*;
 pub use mqtt::*;
 pub use topics::*;
