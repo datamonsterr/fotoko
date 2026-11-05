@@ -132,10 +132,14 @@ export class CheckoutFlow {
       if (!this.disposed || !order || this.checkedOut) return;
       this.order = null;
       this.orderPromise = undefined;
-      const { client = getApiClient } = this.deps;
-      void client()
-        .cancelOrder(order.id)
-        .catch(() => {});
+      try {
+        const { client = getApiClient } = this.deps;
+        void client()
+          .cancelOrder(order.id)
+          .catch(() => {});
+      } catch {
+        // best effort: no client available (e.g. app teardown)
+      }
     };
     // The create may still be in flight: cancel once it lands.
     void pendingOrder.then(cancel, () => {});
