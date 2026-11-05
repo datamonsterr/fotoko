@@ -8,7 +8,7 @@ Expo app -> API Gateway -> Lambda (Rust) -> DynamoDB / S3 / payOS
                               IoT Core (MQTT) <-> Raspberry Pi agent -> CUPS -> printer
 ```
 
-Docs: [terms](CONTEXT.md), [contracts](docs/contracts.md), [architecture decision](docs/adr/0001-architecture.md), [plan](docs/plans/0001-initial-setup.md), [skills](docs/skills.md). Contributor and agent guide: [AGENTS.md](AGENTS.md).
+Docs: [terms](CONTEXT.md), [contracts](docs/contracts.md), [architecture decision](docs/adr/0001-architecture.md), [plan](docs/plans/0001-initial-setup.md), [skills](docs/skills.md), [architecture review](docs/architecture-review.md). Contributor and agent guide: [AGENTS.md](AGENTS.md).
 
 ## Quickstart
 
@@ -22,6 +22,14 @@ bash scripts/ci/all.sh      # check everything
 ```
 
 Optional tools: `cargo-nextest`, `cargo-deny`, `shellcheck`.
+
+## Setup
+
+- [AWS setup](docs/setup/aws.md): accounts, budgets, quotas, CDK bootstrap, GitHub OIDC deploy role, first deploy, payOS secret and webhook, seed a printer, Pi certificate, smoke test.
+- [Services](docs/setup/services.md): payOS, Expo/EAS, GitHub, domain and HTTPS, optional OpenRouter and Context7 keys, monitoring.
+- [Hardware](docs/setup/hardware.md): bill of materials, flashing the Pi, installing, QR sticker, security, maintenance, offline behaviour.
+- [Local development](docs/setup/local-dev.md): run and test everything locally, agent tooling (Chisle, rtk).
+- `.env.example` documents every environment variable; `bash scripts/dev/check-env.sh` verifies it against the code.
 
 ## Layout
 
