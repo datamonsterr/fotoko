@@ -169,4 +169,17 @@ describe('putPhoto', () => {
     ctrl.abort();
     expect(xhr.aborted).toBe(false);
   });
+
+  it('re-checks the signal after reading the photo: aborted meanwhile means no XHR', async () => {
+    const xhr = new FakeXhr();
+    const ctrl = new AbortController();
+    await expect(
+      run(xhr, { signal: ctrl.signal }, async () => {
+        ctrl.abort(); // user left while the file was being read
+        return blob;
+      }),
+    ).rejects.toMatchObject({ code: 'aborted' });
+    expect(xhr.opened).toBeNull();
+    expect(xhr.sent).toBeUndefined();
+  });
 });

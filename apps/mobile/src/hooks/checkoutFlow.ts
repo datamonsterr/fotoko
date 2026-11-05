@@ -71,6 +71,8 @@ export class CheckoutFlow {
   } | null = null;
   private orderPromise: Promise<void> | undefined;
   private disposed = false;
+  private checkedOut = false;
+  private abandonTimer: ReturnType<typeof setTimeout> | undefined;
   private run: Run = { ctrl: new AbortController() };
   private running: Run | null = null;
   private listeners = new Set<() => void>();
@@ -103,6 +105,9 @@ export class CheckoutFlow {
   /** Re-enable after `dispose()`. No-op when not disposed. */
   arm = (): void => {
     if (!this.disposed) return;
+    // StrictMode cleanup + re-run happens in one tick: that is not leaving, keep the order.
+    clearTimeout(this.abandonTimer);
+    this.abandonTimer = undefined;
     this.disposed = false;
     this.run = { ctrl: new AbortController() };
   };
@@ -112,7 +117,29 @@ export class CheckoutFlow {
     this.disposed = true;
     this.run.ctrl.abort();
     this.running = null;
+    // A real unmount (no arm() right after) frees the order we created but never paid for.
+    clearTimeout(this.abandonTimer);
+    this.abandonTimer = setTimeout(() => this.abandon(), 0);
   };
+
+  /** Best-effort cancel of an order the user walked away from before checkout. */
+  private abandon(): void {
+    this.abandonTimer = undefined;
+    const pendingOrder = this.orderPromise;
+    if (!pendingOrder) return;
+    const cancel = () => {
+      const order = this.order;
+      if (!this.disposed || !order || this.checkedOut) return;
+      this.order = null;
+      this.orderPromise = undefined;
+      const { client = getApiClient } = this.deps;
+      void client()
+        .cancelOrder(order.id)
+        .catch(() => {});
+    };
+    // The create may still be in flight: cancel once it lands.
+    void pendingOrder.then(cancel, () => {});
+  }
 
   private live(run: Run): boolean {
     return !this.disposed && this.run === run;
@@ -161,6 +188,7 @@ export class CheckoutFlow {
       const old = this.order;
       this.order = null;
       this.orderPromise = undefined;
+      this.checkedOut = false;
       this.set(run, {
         orderId: null,
         error: null,
@@ -305,6 +333,7 @@ export class CheckoutFlow {
     try {
       const res = await client().checkout(order.id);
       if (!this.live(run)) return;
+      this.checkedOut = true;
       this.set(run, { phase: 'redirected' });
       await onCheckout(res.checkoutUrl, order.id);
     } catch (error) {

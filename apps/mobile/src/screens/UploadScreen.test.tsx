@@ -241,6 +241,8 @@ describe('UploadScreen', () => {
       );
       expect(put).not.toHaveBeenCalled();
       expect(screen.queryByTestId('upload-error')).toBeNull();
+      // a per-photo retry cannot help an expired order: it is disabled, Start over is the way
+      expect(screen.getByTestId('upload-photo-retry-0')).toBeDisabled();
       await fireEvent.press(screen.getByTestId('upload-restart'));
       await waitFor(() =>
         expect(router.replace).toHaveBeenCalledWith({

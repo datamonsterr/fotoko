@@ -175,4 +175,54 @@ describe('aws auth: invalidate and clock', () => {
     const h = await auth.headers({ method: 'GET', url: 'https://h.example/x' });
     expect(h).not.toHaveProperty('x-amz-security-token');
   });
+
+  describe('credential generations', () => {
+    const r = { method: 'GET', url: 'https://h.example/x' };
+    const deferred = () => {
+      let resolve!: (c: AwsCredentials) => void;
+      const promise = new Promise<AwsCredentials>((res) => (resolve = res));
+      return { promise, resolve };
+    };
+
+    it('a fetch started before invalidate() cannot repopulate the cache', async () => {
+      const stale = deferred();
+      const get = jest
+        .fn<Promise<AwsCredentials>, []>()
+        .mockReturnValueOnce(stale.promise)
+        .mockResolvedValueOnce(creds(NOW + 3_600_000, 'FRESH'));
+      const auth = make(get);
+      const first = auth.headers(r); // starts the stale fetch
+      auth.invalidate?.();
+      expect((await auth.headers(r)).authorization).toContain(
+        'Credential=FRESH/',
+      );
+      stale.resolve(creds(NOW + 3_600_000, 'STALE'));
+      await first;
+      // the cache still holds FRESH
+      expect((await auth.headers(r)).authorization).toContain(
+        'Credential=FRESH/',
+      );
+      expect(get).toHaveBeenCalledTimes(2);
+    });
+
+    it('a stale fetch settling does not clear a newer in-flight request', async () => {
+      const stale = deferred();
+      const fresh = deferred();
+      const get = jest
+        .fn<Promise<AwsCredentials>, []>()
+        .mockReturnValueOnce(stale.promise)
+        .mockReturnValueOnce(fresh.promise);
+      const auth = make(get);
+      const a = auth.headers(r);
+      auth.invalidate?.();
+      const b = auth.headers(r); // newer fetch in flight
+      stale.resolve(creds(NOW + 3_600_000, 'STALE'));
+      await a;
+      const c = auth.headers(r); // must join the newer fetch, not start a third
+      fresh.resolve(creds(NOW + 3_600_000, 'FRESH'));
+      expect((await b).authorization).toContain('Credential=FRESH/');
+      expect((await c).authorization).toContain('Credential=FRESH/');
+      expect(get).toHaveBeenCalledTimes(2);
+    });
+  });
 });
