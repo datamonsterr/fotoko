@@ -295,3 +295,72 @@ async fn heartbeat_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(backend: &str, sim: bool) -> Config {
+        let sim = if sim {
+            "[sim]\nout_dir = \"/tmp/fotoko-agent-test-sim\"\n"
+        } else {
+            ""
+        };
+        Config::from_toml(&format!(
+            "printer_id = \"stand-001\"\n[mqtt]\nhost = \"127.0.0.1\"\ntls = false\n[printer]\nbackend = \"{backend}\"\nlpstat_bin = \"/nonexistent/lpstat\"\n{sim}[storage]\nstate_dir = \"/tmp/x\"\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_printer_picks_the_backend() {
+        // Cups: lpstat does not exist, so the state is Error.
+        let cups = build_printer(&config("cups", false)).unwrap();
+        assert_eq!(cups.state().await, PrinterState::Error);
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config("sim", true);
+        c.sim.as_mut().unwrap().out_dir = dir.path().join("o");
+        let sim = build_printer(&c).unwrap();
+        assert_eq!(sim.state().await, PrinterState::Idle);
+    }
+
+    #[test]
+    fn build_printer_reports_sim_problems() {
+        // `Config::from_toml` rejects sim without a section, so build the inconsistent value.
+        let mut c = config("sim", true);
+        c.sim = None;
+        assert!(matches!(build_printer(&c), Err(PrintError::Driver(m)) if m.contains("[sim]")));
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("f");
+        fs::write(&blocker, "x").unwrap();
+        let mut c = config("sim", true);
+        c.sim.as_mut().unwrap().out_dir = blocker.join("o");
+        assert!(build_printer(&c).is_err());
+    }
+
+    #[test]
+    fn from_config_surfaces_printer_errors_and_debug_hides_internals() {
+        let mut c = config("sim", true);
+        c.sim = None;
+        assert!(matches!(Agent::from_config(c), Err(AgentError::Printer(_))));
+        let ok = Agent::from_config(config("cups", false)).unwrap();
+        let text = format!("{ok:?}");
+        assert!(text.contains("stand-001") && text.contains(".."), "{text}");
+    }
+
+    #[test]
+    fn tmp_dir_is_recreated_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        prepare_tmp_dir(&tmp).unwrap();
+        fs::write(tmp.join("stale.jpg"), "x").unwrap();
+        prepare_tmp_dir(&tmp).unwrap();
+        assert!(tmp.is_dir());
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
+        let blocker = dir.path().join("f");
+        fs::write(&blocker, "x").unwrap();
+        let err = prepare_tmp_dir(&blocker.join("tmp")).unwrap_err();
+        assert!(matches!(err, AgentError::StateDir { .. }));
+        assert!(err.to_string().contains("state directory"));
+    }
+}

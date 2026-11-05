@@ -1,6 +1,6 @@
 //! Shared harness: embedded rumqttd broker, "cloud" MQTT client, local image server, agent
 //! runner. Everything binds 127.0.0.1.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Cursor;
 use std::net::{SocketAddr, TcpListener};
@@ -118,10 +118,10 @@ impl Cloud {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Incoming::SubAck(_))) => {
                         acks += 1;
-                        if acks == 2 {
-                            if let Some(tx) = ready_tx.take() {
-                                let _ = tx.send(());
-                            }
+                        if acks == 2
+                            && let Some(tx) = ready_tx.take()
+                        {
+                            let _ = tx.send(());
                         }
                     }
                     Ok(Event::Incoming(Incoming::Publish(p))) => {

@@ -306,9 +306,20 @@ impl FakeCups {
 
     /// Let the printer work through the queue: print what it can, record why it stopped.
     fn process(&self, state: &mut State, now: i64) {
-        state.stop = None;
         let fault = self.fault();
         let paper = state.paper.unwrap_or(self.env.paper);
+        // Like CUPS, a stopped printer stays stopped (even with an empty queue) until the cause
+        // is gone.
+        let was_stopped = state.stop.take().is_some();
+        if was_stopped {
+            state.stop = match fault {
+                Fault::Offline => Some(Stop::Offline),
+                Fault::RibbonOut => Some(Stop::RibbonOut),
+                Fault::DriverError => Some(Stop::DriverError),
+                Fault::None if paper == 0 => Some(Stop::PaperOut),
+                Fault::None => None,
+            };
+        }
         let mut config = SimConfig::new(self.out_dir());
         config.paper = paper;
         config.fault = fault;
@@ -922,6 +933,24 @@ mod tests {
                     .starts_with("printer q is idle.  enabled since ")
             );
         }
+    }
+
+    #[test]
+    fn stopped_printer_stays_stopped_after_cancel_until_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = png(dir.path(), "j-p.png");
+        let c = cups(dir.path());
+        c.set_fault(Fault::Offline).unwrap();
+        c.lp(&v(&["-d", "q", &file]), &mut empty());
+        c.cancel(&v(&["q-1"]));
+        assert!(c.lpstat(&v(&["-p", "q"])).stdout.contains("disabled since"));
+        // The cause changes kind, the printer stays stopped.
+        c.set_fault(Fault::RibbonOut).unwrap();
+        assert!(c.lpstat(&v(&["-p", "q"])).stdout.contains("Ribbon"));
+        c.set_fault(Fault::DriverError).unwrap();
+        assert!(c.lpstat(&v(&["-p", "q"])).stdout.contains("Filter failed."));
+        c.set_fault(Fault::None).unwrap();
+        assert!(c.lpstat(&v(&["-p", "q"])).stdout.contains("is idle"));
     }
 
     #[test]
