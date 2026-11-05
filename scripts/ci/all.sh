@@ -25,6 +25,7 @@ has() { command -v "$1" >/dev/null 2>&1; }
 
 repro rust-lint
 repro rust-test
+repro arch
 repro rust-e2e # skips itself until crates/e2e exists
 
 if cargo deny --version >/dev/null 2>&1; then

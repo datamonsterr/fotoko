@@ -20,7 +20,39 @@
             "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/enforce-subagent-models.py\""
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/rtk-rewrite.sh\"",
+            "timeout": 10
+          }
+        ]
       }
     ]
+  },
+  "extraKnownMarketplaces": {
+    "fotoko-pinned": {
+      "source": {
+        "source": "settings",
+        "name": "fotoko-pinned",
+        "plugins": [
+          {
+            "name": "chisle",
+            "source": {
+              "source": "github",
+              "repo": "JayPokale/Chisle",
+              "ref": "main",
+              "sha": "1b3203fe394ee84ca143a1e8636fafa8e9e1f906"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "enabledPlugins": {
+    "chisle@fotoko-pinned": true
   }
 }
