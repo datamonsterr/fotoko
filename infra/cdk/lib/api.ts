@@ -77,7 +77,9 @@ export class Api extends Construct {
           'x-amz-date',
           'x-amz-security-token',
           'x-amz-content-sha256',
+          'x-request-id',
         ],
+        exposeHeaders: ['date', 'x-request-id'],
         maxAge: Duration.hours(1),
       },
     });

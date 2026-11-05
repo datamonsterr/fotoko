@@ -2,16 +2,16 @@
 
 AWS CDK v2 app (TypeScript) for Fotoko: one stack per stage (`Fotoko-dev`, `Fotoko-prod`) in `ap-southeast-1`. Interfaces come from `docs/contracts.md`.
 
-| File                | Concern                                                                       |
-| ------------------- | ----------------------------------------------------------------------------- |
-| `lib/data.ts`       | DynamoDB table, photos bucket, payOS secret                                   |
-| `lib/web.ts`        | Web bucket + CloudFront (OAC), SPA fallback, optional `BucketDeployment`      |
-| `lib/functions.ts`  | `fotoko-http` and `fotoko-iot-status` Lambdas and their least-privilege roles |
-| `lib/api.ts`        | HTTP API, routes and IAM authorizer, throttling, access logs                  |
-| `lib/auth.ts`       | Cognito guest identity pool and role, placeholder operator user pool          |
-| `lib/iot.ts`        | IoT data endpoint lookup, thing type, device policy, status topic rule        |
-| `lib/monitoring.ts` | Lambda error/throttle, IoT rule failure and API 5xx alarms, SNS topic         |
-| `lib/nag.ts`        | cdk-nag `AwsSolutionsChecks` (acknowledgments live next to each resource)     |
+| File                | Concern                                                                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `lib/data.ts`       | DynamoDB table, photos bucket, payOS secret                                                                                     |
+| `lib/web.ts`        | Web bucket + CloudFront (OAC), SPA fallback, optional `BucketDeployment`                                                        |
+| `lib/functions.ts`  | `fotoko-http`, `fotoko-iot-status` and `fotoko-expire` Lambdas (the last on a 5 minute EventBridge rule), least-privilege roles |
+| `lib/api.ts`        | HTTP API, routes and IAM authorizer, throttling, access logs                                                                    |
+| `lib/auth.ts`       | Cognito guest identity pool and role, placeholder operator user pool                                                            |
+| `lib/iot.ts`        | IoT data endpoint lookup, thing type, device policy, status topic rule                                                          |
+| `lib/monitoring.ts` | Lambda error/throttle, IoT rule failure and API 5xx alarms, SNS topic                                                           |
+| `lib/nag.ts`        | cdk-nag `AwsSolutionsChecks` (acknowledgments live next to each resource)                                                       |
 
 ## Commands
 
@@ -26,7 +26,7 @@ Stage: `-c stage=prod` or `FOTOKO_STAGE=prod` (default `dev`). Extra CORS origin
 
 ### Lambda binaries
 
-CDK reads `fotoko-http/bootstrap` and `fotoko-iot-status/bootstrap` from `FOTOKO_LAMBDA_DIR`. A relative value is resolved from the repository root; the default is `<repo>/target/lambda` (the `cargo lambda build --release --arm64` output). Without binaries, synth with the test fixtures:
+CDK reads `fotoko-http/bootstrap`, `fotoko-iot-status/bootstrap` and `fotoko-expire/bootstrap` from `FOTOKO_LAMBDA_DIR`. A relative value is resolved from the repository root; the default is `<repo>/target/lambda` (the `cargo lambda build --release --arm64` output). Without binaries, synth with the test fixtures:
 
 ```sh
 FOTOKO_LAMBDA_DIR=infra/cdk/test/fixtures/lambda pnpm --filter @fotoko/infra synth
@@ -52,5 +52,5 @@ Replace the placeholders in the payOS secret (`clientId`, `apiKey`); `checksumKe
 - Thing types are unique per account and region: prod owns `fotoko-printer`, other stages use `fotoko-printer-<stage>`.
 - The SPA fallback returns `index.html` with 200 for any 403/404 from the web bucket, so a missing asset is not reported as 404.
 - No operator user pool yet: add one with the operator features.
-- Known follow-ups: WAF in front of the API and CloudFront, and reserved concurrency on the Lambdas (needs a raised account concurrency quota). Per-route throttling is in place meanwhile.
+- Known follow-ups: WAF in front of the API and CloudFront, and reserved concurrency on `fotoko-http` and `fotoko-iot-status`. `fotoko-expire` already reserves 1; deploying it needs the account to keep at least 10 unreserved executions (a brand-new account with the default quota of 10 must request an increase first). Per-route throttling is in place meanwhile.
 - cdk-nag v3 acknowledgments are per finding (`Validations.of(...).acknowledge`), so wildcard ARN ids embed logical ids and are computed in code.
