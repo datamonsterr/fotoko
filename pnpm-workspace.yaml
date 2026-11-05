@@ -4,5 +4,6 @@ packages:
   - infra/*
 
 allowBuilds:
+  '@parcel/watcher': true
   esbuild: false
   lefthook: true
