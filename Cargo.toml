@@ -26,6 +26,8 @@ uuid = { version = "1.29.0", features = ["v4", "serde"] }
 # Workspace crates
 fotoko-protocol = { path = "crates/protocol" }
 fotoko-core = { path = "crates/core" }
+fotoko-printer-sim = { path = "crates/printer-sim" }
+fotoko-pi-agent = { path = "crates/pi-agent" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -54,6 +56,61 @@ incremental = false
 
 [profile.test.package."*"]
 debug = false
+
+# Image decoding and resizing are far too slow unoptimized (printer-sim and pi-agent tests).
+# The decode chain is image -> png (-> fdeflate, flate2 -> miniz_oxide, crc32fast, simd-adler32)
+# and zune-jpeg (-> zune-core); moxcms/pxfm come with image's colour handling. Keep this list in
+# step with `cargo tree -p fotoko-printer-sim` when image is upgraded.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.moxcms]
+opt-level = 3
+[profile.dev.package.pxfm]
+opt-level = 3
+[profile.test.package.image]
+opt-level = 3
+[profile.test.package.png]
+opt-level = 3
+[profile.test.package.zune-jpeg]
+opt-level = 3
+[profile.test.package.zune-core]
+opt-level = 3
+[profile.test.package.fdeflate]
+opt-level = 3
+[profile.test.package.flate2]
+opt-level = 3
+[profile.test.package.miniz_oxide]
+opt-level = 3
+[profile.test.package.simd-adler32]
+opt-level = 3
+[profile.test.package.crc32fast]
+opt-level = 3
+[profile.test.package.moxcms]
+opt-level = 3
+[profile.test.package.pxfm]
+opt-level = 3
+
+# Generic image code is monomorphized in the calling crate.
+[profile.dev.package.fotoko-printer-sim]
+opt-level = 3
+[profile.test.package.fotoko-printer-sim]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

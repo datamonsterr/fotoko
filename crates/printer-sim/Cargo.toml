@@ -1,0 +1,27 @@
+[package]
+name = "fotoko-printer-sim"
+description = "Gutenprint/CUPS simulation: SimPrinter library plus fake lp, lpstat and cancel binaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["clock"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# The CUPS backend of the agent is tested against the fake binaries built by this package
+# (CARGO_BIN_EXE_* only exists in the package that owns the binaries). A dev-dependency cycle
+# with fotoko-pi-agent, which depends on this crate, is allowed by Cargo.
+[dev-dependencies]
+fotoko-pi-agent.workspace = true
+fotoko-protocol.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true
+
+[lints]
+workspace = true
