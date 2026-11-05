@@ -1,0 +1,28 @@
+name: Deny
+
+# New advisories appear without any commit: check dependencies weekly (CI only runs on changes).
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/ci/summary.sh "deny (weekly)" "bash scripts/ci/repro.sh deny" "cargo deny --all-features check"

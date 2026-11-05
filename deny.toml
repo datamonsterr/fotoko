@@ -1,11 +1,26 @@
 # cargo deny check (advisories, licenses, bans, sources)
 [advisories]
 version = 2
-ignore = []
+# rumqttc 0.25.1 and rumqttd 0.20.0 are the latest releases (crates.io, checked 2026-11-05).
+# rumqttc depends on rustls-webpki 0.102.8, but only for an error type in its public API:
+# certificate verification runs in rustls 0.23, which uses rustls-webpki 0.103.x (not affected).
+# So the RUSTSEC-2026 webpki advisories are not reachable through our TLS connections.
+# rustls-pemfile is a maintenance notice only (no vulnerability), pulled in by rumqttc.
+# Remove these entries once rumqttc drops the 0.102 dependency. Review by 2027-02-05;
+# tracked in docs/ci.md.
+ignore = [
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 is only rumqttc's error type; verification uses 0.103.x" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 is only rumqttc's error type; verification uses 0.103.x" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 is only rumqttc's error type; verification uses 0.103.x" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 is only rumqttc's error type; verification uses 0.103.x" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.102.8 is only rumqttc's error type; verification uses 0.103.x" },
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained notice for rustls-pemfile (no vulnerability); pulled in by rumqttc" },
+]
 
 [licenses]
 version = 2
 confidence-threshold = 0.9
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",
@@ -25,6 +40,7 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

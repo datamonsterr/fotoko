@@ -64,11 +64,15 @@ describe('HTTP API routes', () => {
       CorsConfiguration: {
         AllowOrigins: Match.anyValue(),
         AllowMethods: ['GET', 'POST', 'OPTIONS'],
-        AllowHeaders: Match.arrayWith([
+        AllowHeaders: [
           'authorization',
+          'content-type',
           'x-amz-date',
           'x-amz-security-token',
-        ]),
+          'x-amz-content-sha256',
+          'x-request-id',
+        ],
+        ExposeHeaders: ['date', 'x-request-id'],
         MaxAge: 3600,
       },
     });
