@@ -972,8 +972,21 @@ async fn concurrent_webhook_on_a_vanished_order_is_not_found() {
 /// A webhook whose signed `data` carries `signed_code` and whose unsigned envelope says
 /// `outer_code`, with a valid signature over `data`.
 fn webhook_codes(code: i64, signed_code: Option<&str>, outer_code: &str) -> PayosWebhook {
+    let value = signed_code.map_or(serde_json::Value::Null, serde_json::Value::from);
+    webhook_with_signed_code(code, Some(value), outer_code)
+}
+
+/// Like [`webhook_codes`] with the raw JSON of `data.code`; `None` leaves the key out.
+fn webhook_with_signed_code(
+    code: i64,
+    signed: Option<serde_json::Value>,
+    outer_code: &str,
+) -> PayosWebhook {
     let mut webhook = signed_webhook(TEST_CHECKSUM_KEY, "00", code, 50_000).expect("webhook");
-    webhook.data.code = signed_code.map(str::to_owned);
+    match signed {
+        Some(value) => webhook.data.extra.insert("code".into(), value),
+        None => webhook.data.extra.remove("code"),
+    };
     webhook.signature =
         crate::payos::sign_webhook_data(TEST_CHECKSUM_KEY, &webhook.data).expect("sign");
     webhook.code = outer_code.to_owned();
@@ -1004,17 +1017,40 @@ async fn payment_result_comes_from_the_signed_data_code() {
 async fn webhook_without_a_signed_code_is_rejected() {
     let h = harness();
     let (id, code) = awaiting_payment(&h).await;
-    let missing = webhook_codes(code, None, "00");
-    let err = h
-        .service
-        .handle_payos_webhook(&missing)
-        .await
-        .expect_err("no code");
-    assert_eq!(
-        err,
-        CoreError::Validation("webhook data has no code".into())
-    );
+    let no_code = CoreError::Validation("webhook data has no code".into());
+    // Key absent, key null and key not a string all count as "no code".
+    for signed in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!(0)),
+    ] {
+        let webhook = webhook_with_signed_code(code, signed, "00");
+        let err = h
+            .service
+            .handle_payos_webhook(&webhook)
+            .await
+            .expect_err("no code");
+        assert_eq!(err, no_code);
+    }
     assert_eq!(status_of(&h, &id), OrderStatus::AwaitingPayment);
+}
+
+#[tokio::test]
+async fn webhook_with_null_desc_still_verifies_and_pays() {
+    let h = harness();
+    let (id, code) = awaiting_payment(&h).await;
+    let mut webhook = webhook_with_signed_code(code, Some(serde_json::json!("00")), "00");
+    webhook
+        .data
+        .extra
+        .insert("desc".into(), serde_json::Value::Null);
+    webhook.signature =
+        crate::payos::sign_webhook_data(TEST_CHECKSUM_KEY, &webhook.data).expect("sign");
+    assert_eq!(
+        h.service.handle_payos_webhook(&webhook).await,
+        Ok(WebhookOutcome::Paid)
+    );
+    assert_eq!(status_of(&h, &id), OrderStatus::Paid);
 }
 
 // ---- job status ----

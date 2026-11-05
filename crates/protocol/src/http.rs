@@ -272,16 +272,19 @@ pub struct PayosWebhookData {
     pub order_code: i64,
     /// Paid amount in VND.
     pub amount: u64,
-    /// Payment result inside the signed data: `"00"` means paid. The outer
-    /// [`PayosWebhook::code`] is not covered by the signature, so decisions must use this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-    /// Result description inside the signed data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desc: Option<String>,
-    /// Remaining payOS fields.
+    /// Remaining payOS fields, including `code` and `desc`. They stay raw JSON values so that
+    /// presence and `null` survive exactly as sent, which the signature depends on.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl PayosWebhookData {
+    /// The payment result inside the signed data: `"00"` means paid. `None` when `code` is
+    /// missing, `null` or not a string. The outer [`PayosWebhook::code`] is not covered by the
+    /// signature, so decisions must use this one.
+    pub fn code(&self) -> Option<&str> {
+        self.extra.get("code").and_then(serde_json::Value::as_str)
+    }
 }
 
 /// `POST /v1/payments/payos/webhook` body.
@@ -550,8 +553,6 @@ mod tests {
             data: PayosWebhookData {
                 order_code: 42,
                 amount: 10_000,
-                code: None,
-                desc: None,
                 extra: BTreeMap::from([
                     ("currency".to_owned(), json!("VND")),
                     ("paymentLinkId".to_owned(), json!("abc")),
@@ -569,23 +570,24 @@ mod tests {
     }
 
     #[test]
-    fn payos_webhook_data_types_code_and_desc() {
-        let data = PayosWebhookData {
-            order_code: 42,
-            amount: 10_000,
-            code: Some("00".into()),
-            desc: Some("Thành công".into()),
-            extra: BTreeMap::from([("currency".to_owned(), json!("VND"))]),
+    fn payos_webhook_data_code_accessor() {
+        let parse = |v: Value| -> PayosWebhookData {
+            let mut base = json!({"orderCode": 1, "amount": 2});
+            if let (Some(b), Value::Object(more)) = (base.as_object_mut(), v) {
+                b.extend(more);
+            }
+            serde_json::from_value(base).expect("deserialize")
         };
+        assert_eq!(parse(json!({"code": "00"})).code(), Some("00"));
+        assert_eq!(parse(json!({})).code(), None);
+        assert_eq!(parse(json!({"code": null})).code(), None);
+        assert_eq!(parse(json!({"code": 0})).code(), None);
+        // Null survives a round trip, so it still signs as `code=`.
+        let data = parse(json!({"code": null, "desc": null}));
+        assert_eq!(data.extra.get("desc"), Some(&Value::Null));
         check(
             &data,
-            json!({"orderCode": 42, "amount": 10000, "code": "00", "desc": "Thành công",
-                   "currency": "VND"}),
+            json!({"orderCode": 1, "amount": 2, "code": null, "desc": null}),
         );
-        // Without them the wire format is unchanged and they stay absent.
-        let bare: PayosWebhookData =
-            serde_json::from_value(json!({"orderCode": 1, "amount": 2})).expect("deserialize");
-        assert_eq!((bare.code, bare.desc), (None, None));
-        assert!(bare.extra.is_empty());
     }
 }

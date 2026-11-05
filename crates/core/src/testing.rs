@@ -475,9 +475,12 @@ pub fn signed_webhook(
     let data = PayosWebhookData {
         order_code,
         amount,
-        code: Some(code.to_owned()),
-        desc: Some(if code == "00" { "success" } else { "failed" }.to_owned()),
         extra: BTreeMap::from([
+            ("code".to_owned(), serde_json::json!(code)),
+            (
+                "desc".to_owned(),
+                serde_json::json!(if code == "00" { "success" } else { "failed" }),
+            ),
             ("currency".to_owned(), serde_json::json!("VND")),
             (
                 "description".to_owned(),

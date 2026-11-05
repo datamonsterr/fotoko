@@ -421,7 +421,7 @@ impl OrderService {
         if !payos::verify_webhook(&self.config.payos_checksum_key, webhook) {
             return Err(CoreError::Validation("invalid webhook signature".into()));
         }
-        let Some(signed_code) = webhook.data.code.as_deref() else {
+        let Some(signed_code) = webhook.data.code() else {
             return Err(CoreError::Validation("webhook data has no code".into()));
         };
         let order_code = webhook.data.order_code;
