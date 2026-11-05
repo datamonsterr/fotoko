@@ -5,6 +5,17 @@
 //! `{code:"00", desc, data:{orderCode, amount, checkoutUrl, qrCode, ...}, signature}` where
 //! `signature` is the HMAC-SHA256 of the sorted `data` fields, the same scheme as webhooks, so
 //! it is verified with `fotoko_core::payos::verify_webhook`.
+//!
+//! Each call is a single attempt: no retries (creating a link twice would be harmless but a
+//! slow payOS must not hold the customer), no redirects (credentials are sent in headers and
+//! must never follow a `Location` elsewhere), a 5 s connect timeout and a 15 s total timeout.
+//! The Lambda timeout of `fotoko-http` must therefore exceed 15 s plus the other calls of a
+//! checkout (S3 `HeadObject` per photo, DynamoDB), so 29 s (the API Gateway maximum) is
+//! comfortable.
+//!
+//! The checksum key is read once per container. After a key rotation the router rebuilds the
+//! service from Secrets Manager the first time a webhook signature fails or a checkout fails at
+//! payOS (at most once a minute): see `fotoko_api::ServiceRefresher`.
 
 use std::fmt;
 use std::time::Duration;
@@ -92,6 +103,7 @@ impl PayosClient {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CoreError::Internal(format!("cannot build the HTTP client: {e}")))?;
         Ok(Self {
@@ -363,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_errors_are_provider_errors() {
-        for status in [401_u16, 429, 500] {
+        for status in [302_u16, 401, 429, 500] {
             let message = expect_provider_error(
                 ResponseTemplate::new(status).set_body_json(json!({"code": "20", "desc": "bad"})),
             )

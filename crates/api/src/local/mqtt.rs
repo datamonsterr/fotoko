@@ -46,15 +46,18 @@ impl JobPublisher for MqttJobPublisher {
     async fn publish_job(&self, job: &PrintJob) -> Result<(), CoreError> {
         let payload = serde_json::to_vec(job)
             .map_err(|e| CoreError::Internal(format!("cannot serialize the print job: {e}")))?;
+        // Never wait for room in the queue: a dead broker would stall the webhook. A full queue
+        // is an error, so payOS retries the webhook and the job is published then.
         self.client
-            .publish(
+            .try_publish(
                 jobs_topic(&job.printer_id),
                 QoS::AtLeastOnce,
                 false,
                 payload,
             )
-            .await
-            .map_err(|e| CoreError::Internal(format!("cannot queue the print job: {e}")))
+            .map_err(|_| {
+                CoreError::Internal("cannot queue the print job: MQTT queue full or closed".into())
+            })
     }
 }
 
@@ -198,6 +201,25 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_is_an_error_not_a_stall() {
+        // Nothing drives the event loop, so the request queue (64 packets) fills up.
+        let (publisher, _events) = connect("mqtt://127.0.0.1:1", "full-queue").expect("connect");
+        let job: PrintJob = serde_json::from_value(json!({
+            "jobId": "j", "orderId": "o", "printerId": "stand-001", "media": "4x6",
+            "createdAt": "2026-01-01T00:00:00Z", "photos": []
+        }))
+        .expect("job");
+        let mut failure = None;
+        for _ in 0..200 {
+            if let Err(error) = publisher.publish_job(&job).await {
+                failure = Some(error);
+                break;
+            }
+        }
+        assert!(matches!(failure, Some(CoreError::Internal(m)) if m.contains("cannot queue")));
     }
 
     #[test]

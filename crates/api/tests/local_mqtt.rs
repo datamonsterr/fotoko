@@ -14,42 +14,52 @@ use reqwest::Method;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde_json::json;
 
-/// Start a broker on a free port and return that port.
+/// Start a broker and return its port. The broker binds its own listener, so the port is
+/// probed first; if another process grabs it in between, the broker reports the bind error and
+/// the start is retried on a new port.
 fn start_broker() -> u16 {
-    let port = {
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
-    let config: rumqttd::Config = serde_json::from_value(json!({
-        "id": 0,
-        "router": {
-            "max_connections": 100,
-            "max_outgoing_packet_count": 200,
-            "max_segment_size": 1_048_576,
-            "max_segment_count": 10
-        },
-        "v4": {"1": {
-            "name": "v4-1",
-            "listen": format!("127.0.0.1:{port}"),
-            "next_connection_delay_ms": 1,
-            "connections": {
-                "connection_timeout_ms": 60_000,
-                "max_payload_size": 65_536,
-                "max_inflight_count": 100,
-                "dynamic_filters": true
+    for _ in 0..10 {
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let config: rumqttd::Config = serde_json::from_value(json!({
+            "id": 0,
+            "router": {
+                "max_connections": 100,
+                "max_outgoing_packet_count": 200,
+                "max_segment_size": 1_048_576,
+                "max_segment_count": 10
+            },
+            "v4": {"1": {
+                "name": "v4-1",
+                "listen": format!("127.0.0.1:{port}"),
+                "next_connection_delay_ms": 1,
+                "connections": {
+                    "connection_timeout_ms": 60_000,
+                    "max_payload_size": 65_536,
+                    "max_inflight_count": 100,
+                    "dynamic_filters": true
+                }
+            }}
+        }))
+        .unwrap();
+        // `start` only returns when the broker stopped, which at this point means a bind error.
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut broker = rumqttd::Broker::new(config);
+            let _ = broker.start();
+            let _ = stopped_tx.send(());
+        });
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return port;
             }
-        }}
-    }))
-    .unwrap();
-    std::thread::spawn(move || {
-        let mut broker = rumqttd::Broker::new(config);
-        let _ = broker.start();
-    });
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return port;
+            if stopped_rx.try_recv().is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
     panic!("broker did not start");
 }

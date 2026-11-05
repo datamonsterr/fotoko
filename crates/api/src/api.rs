@@ -1,7 +1,10 @@
 //! The axum router implementing the HTTP API of `docs/contracts.md` over [`OrderService`].
 
+use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
+use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -24,13 +27,83 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Request id header, read from the caller when sane and echoed on every response.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// `CoreError::Validation` message the service uses for a bad webhook signature.
+const INVALID_SIGNATURE: &str = "invalid webhook signature";
+
+/// Re-reads the payOS secret after a verification failure, so a rotated checksum key does not
+/// need a Lambda container recycle.
+#[async_trait]
+pub trait ServiceRefresher: Send + Sync {
+    /// A service built on freshly loaded secrets, or `None` when nothing changed (or a refresh
+    /// was done too recently).
+    async fn refresh(&self) -> Result<Option<OrderService>, CoreError>;
+}
+
 /// Shared state of the router.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
-    /// The use cases.
-    pub service: OrderService,
+    service: Arc<RwLock<OrderService>>,
+    identity_mode: IdentityMode,
+    refresher: Option<Arc<dyn ServiceRefresher>>,
+}
+
+impl fmt::Debug for AppState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppState")
+            .field("identity_mode", &self.identity_mode)
+            .field("refreshable", &self.refresher.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppState {
+    /// State over `service`; identities come from `identity_mode`.
+    pub fn new(service: OrderService, identity_mode: IdentityMode) -> Self {
+        Self {
+            service: Arc::new(RwLock::new(service)),
+            identity_mode,
+            refresher: None,
+        }
+    }
+
+    /// Let the router refresh the service when payOS verification fails once.
+    #[must_use]
+    pub fn with_refresher(mut self, refresher: Arc<dyn ServiceRefresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
+    }
+
     /// Where caller identities come from.
-    pub identity_mode: IdentityMode,
+    pub fn identity_mode(&self) -> IdentityMode {
+        self.identity_mode
+    }
+
+    /// The current service (cheap clone).
+    pub fn service(&self) -> OrderService {
+        self.service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Ask the refresher for a new service and swap it in. `true` when the service changed.
+    async fn refresh(&self) -> bool {
+        let Some(refresher) = &self.refresher else {
+            return false;
+        };
+        match refresher.refresh().await {
+            Ok(Some(fresh)) => {
+                *self.service.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+                tracing::info!("payOS secret changed, service rebuilt");
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::error!(%error, "refreshing the payOS secret failed");
+                false
+            }
+        }
+    }
 }
 
 /// The HTTP API with request ids and access logs.
@@ -112,7 +185,7 @@ async fn get_printer(
     Path(raw): Path<String>,
 ) -> Result<Json<fotoko_protocol::PrinterInfo>, ApiError> {
     let id = printer_id(&raw)?;
-    Ok(Json(state.service.get_printer(&id).await?))
+    Ok(Json(state.service().get_printer(&id).await?))
 }
 
 async fn create_order(
@@ -120,7 +193,7 @@ async fn create_order(
     Identity(owner): Identity,
     JsonBody(request): JsonBody<CreateOrderRequest>,
 ) -> Result<(StatusCode, Json<fotoko_protocol::CreateOrderResponse>), ApiError> {
-    let response = state.service.create_order(&owner, &request).await?;
+    let response = state.service().create_order(&owner, &request).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -131,7 +204,7 @@ async fn get_order(
 ) -> Result<Json<fotoko_protocol::Order>, ApiError> {
     Ok(Json(
         state
-            .service
+            .service()
             .get_order(&owner, &OrderId::from(order_id))
             .await?,
     ))
@@ -142,12 +215,15 @@ async fn checkout(
     Identity(owner): Identity,
     Path(order_id): Path<String>,
 ) -> Result<Json<fotoko_protocol::CheckoutResponse>, ApiError> {
-    Ok(Json(
-        state
-            .service
-            .checkout(&owner, &OrderId::from(order_id))
-            .await?,
-    ))
+    let result = state
+        .service()
+        .checkout(&owner, &OrderId::from(order_id))
+        .await;
+    if matches!(result, Err(CoreError::PaymentProvider(_))) {
+        // A rotated payOS key shows up here first; the next request then uses the new one.
+        state.refresh().await;
+    }
+    Ok(Json(result?))
 }
 
 async fn cancel(
@@ -157,7 +233,7 @@ async fn cancel(
 ) -> Result<Json<fotoko_protocol::Order>, ApiError> {
     Ok(Json(
         state
-            .service
+            .service()
             .cancel(&owner, &OrderId::from(order_id))
             .await?,
     ))
@@ -171,7 +247,14 @@ async fn payos_webhook(
     JsonBody(webhook): JsonBody<PayosWebhook>,
 ) -> Result<Json<WebhookAck>, ApiError> {
     let order_code = webhook.data.order_code;
-    match state.service.handle_payos_webhook(&webhook).await {
+    let mut result = state.service().handle_payos_webhook(&webhook).await;
+    if matches!(&result, Err(CoreError::Validation(m)) if m == INVALID_SIGNATURE)
+        && state.refresh().await
+    {
+        // The key was rotated since this container started: verify once more with the new one.
+        result = state.service().handle_payos_webhook(&webhook).await;
+    }
+    match result {
         Ok(WebhookOutcome::LatePayment) => {
             tracing::warn!(
                 order_code,
@@ -268,10 +351,7 @@ mod tests {
     }
 
     fn app(h: &Harness, mode: IdentityMode) -> Router {
-        router(AppState {
-            service: h.service.clone(),
-            identity_mode: mode,
-        })
+        router(AppState::new(h.service.clone(), mode))
     }
 
     async fn call(app: &Router, request: Request<Body>) -> Reply {
@@ -841,5 +921,158 @@ mod tests {
         // Public routes need no identity.
         let r = call(&a, req(Method::GET, "/v1/printers/stand-001", None, None)).await;
         assert_eq!(r.status, 200);
+    }
+
+    struct FakeRefresher {
+        next: std::sync::Mutex<Result<Option<OrderService>, CoreError>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeRefresher {
+        fn new(next: Result<Option<OrderService>, CoreError>) -> Arc<Self> {
+            Arc::new(Self {
+                next: std::sync::Mutex::new(next),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ServiceRefresher for FakeRefresher {
+        async fn refresh(&self) -> Result<Option<OrderService>, CoreError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.next.lock().expect("lock").clone()
+        }
+    }
+
+    /// The harness's ports with another payOS checksum key (a rotated secret).
+    fn rotated_service(h: &Harness, key: &str) -> OrderService {
+        OrderService::new(
+            fotoko_core::Ports {
+                orders: Arc::new(h.orders.clone()),
+                printers: Arc::new(h.printers.clone()),
+                store: Arc::new(h.store.clone()),
+                publisher: Arc::new(h.publisher.clone()),
+                payments: Arc::new(h.payments.clone()),
+                clock: Arc::new(h.clock.clone()),
+                ids: Arc::new(h.ids.clone()),
+            },
+            fotoko_core::ServiceConfig::new(fotoko_core::testing::TEST_APP_URL, key)
+                .expect("config"),
+        )
+    }
+
+    fn app_with(h: &Harness, refresher: Arc<FakeRefresher>) -> Router {
+        router(AppState::new(h.service.clone(), IdentityMode::Local).with_refresher(refresher))
+    }
+
+    async fn webhook_with_key(app: &Router, key: &str, order_code: i64, amount: u64) -> Reply {
+        let hook = signed_webhook(key, "00", order_code, amount).expect("sign");
+        call(
+            app,
+            req(
+                Method::POST,
+                "/v1/payments/payos/webhook",
+                None,
+                Some(serde_json::to_value(hook).expect("json")),
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn rotated_key_is_picked_up_once_on_a_signature_failure() {
+        let h = harness();
+        let (id, code) = checked_out(&h, &app(&h, IdentityMode::Local)).await;
+        let refresher = FakeRefresher::new(Ok(Some(rotated_service(&h, "rotated-key"))));
+        let a = app_with(&h, refresher.clone());
+
+        let r = webhook_with_key(&a, "rotated-key", code, 30_000).await;
+        assert_eq!((r.status, r.body), (200, json!({"success": true})));
+        assert_eq!(refresher.calls(), 1);
+        assert_eq!(
+            h.orders
+                .snapshot(&id.as_str().into())
+                .expect("order")
+                .status,
+            OrderStatus::Paid
+        );
+        // The rotated service is now the current one: no refresh needed for the next webhook.
+        let r = webhook_with_key(&a, "rotated-key", code, 30_000).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(refresher.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn bad_signatures_stay_400_when_nothing_changed_or_refresh_fails() {
+        let h = harness();
+        let (_, code) = checked_out(&h, &app(&h, IdentityMode::Local)).await;
+        for next in [Ok(None), Err(CoreError::Internal("secrets down".into()))] {
+            let refresher = FakeRefresher::new(next);
+            let a = app_with(&h, refresher.clone());
+            let r = webhook_with_key(&a, "wrong-key", code, 30_000).await;
+            assert_eq!(
+                (r.status, error_of(&r)),
+                (400, ("validation", INVALID_SIGNATURE))
+            );
+            assert_eq!(refresher.calls(), 1);
+        }
+        // Without a refresher the first verdict stands.
+        let r = webhook_with_key(&app(&h, IdentityMode::Local), "wrong-key", code, 30_000).await;
+        assert_eq!(r.status, 400);
+    }
+
+    #[tokio::test]
+    async fn other_webhook_errors_do_not_refresh() {
+        let h = harness();
+        let (_, code) = checked_out(&h, &app(&h, IdentityMode::Local)).await;
+        let refresher = FakeRefresher::new(Ok(None));
+        let a = app_with(&h, refresher.clone());
+        let r = webhook_with_key(&a, TEST_CHECKSUM_KEY, code, 1).await; // amount mismatch
+        assert_eq!(r.status, 400);
+        let r = webhook_with_key(&a, TEST_CHECKSUM_KEY, code, 30_000).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(refresher.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn checkout_provider_failure_triggers_a_refresh_but_no_retry() {
+        let h = harness();
+        let refresher = FakeRefresher::new(Ok(None));
+        let a = app_with(&h, refresher.clone());
+        let id = create(&a, "me").await["orderId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        h.store
+            .mark_order_uploaded(&h.orders.snapshot(&id.as_str().into()).expect("order"));
+        h.payments
+            .fail_with(Some(CoreError::PaymentProvider("bad key".into())));
+        let r = call(
+            &a,
+            req(
+                Method::POST,
+                &format!("/v1/orders/{id}/checkout"),
+                Some("me"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(r.status, 502);
+        assert_eq!(refresher.calls(), 1);
+        assert_eq!(h.payments.requests().len(), 0);
+    }
+
+    #[test]
+    fn state_debug_does_not_dump_the_service() {
+        let h = harness();
+        let state = AppState::new(h.service.clone(), IdentityMode::Aws);
+        let text = format!("{state:?}");
+        assert!(text.contains("refreshable: false"));
+        assert_eq!(state.identity_mode(), IdentityMode::Aws);
     }
 }

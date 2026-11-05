@@ -68,7 +68,7 @@ impl FromRequestParts<AppState> for Identity {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        resolve(state.identity_mode, parts)
+        resolve(state.identity_mode(), parts)
             .map(Self)
             .ok_or_else(|| CoreError::Forbidden("missing caller identity".into()).into())
     }

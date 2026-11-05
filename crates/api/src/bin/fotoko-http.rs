@@ -12,10 +12,7 @@ async fn main() -> Result<(), lambda_http::Error> {
         return Err("fotoko-http only runs with FOTOKO_MODE=aws; use fotoko-local".into());
     }
     let config = HttpConfig::from_lookup(&process_env)?;
-    let service = load_http_service(&config).await?;
-    let app = router(AppState {
-        service,
-        identity_mode: IdentityMode::Aws,
-    });
+    let (service, refresher) = load_http_service(&config).await?;
+    let app = router(AppState::new(service, IdentityMode::Aws).with_refresher(refresher));
     lambda_http::run(app).await
 }
